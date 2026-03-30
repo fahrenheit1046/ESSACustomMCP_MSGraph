@@ -1,0 +1,13 @@
+{
+  "name": "mcp-outlook",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@azure/msal-node": "^2.0.0",
+    "node-fetch": "^3.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

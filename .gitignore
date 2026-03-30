@@ -1,0 +1,4 @@
+node_modules/
+mcp-outlook-token.json
+auth.mjs
+.env
