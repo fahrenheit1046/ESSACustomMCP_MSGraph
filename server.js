@@ -1,67 +1,74 @@
+import express from "express";
+import session from "express-session";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { PublicClientApplication } from "@azure/msal-node";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { ConfidentialClientApplication } from "@azure/msal-node";
+import { Pool } from "pg";
 import fetch from "node-fetch";
 import { z } from "zod";
-import fs from "fs";
-import path from "path";
+import crypto from "crypto";
 
-// ---------------------------------------------------------------------------
-// Config — fill in your Azure app details
-// ---------------------------------------------------------------------------
+const PORT = process.env.PORT || 3000;
 const CLIENT_ID = process.env.AZURE_CLIENT_ID;
 const TENANT_ID = process.env.AZURE_TENANT_ID;
-const TOKEN_CACHE_FILE = path.join(process.env.APPDATA || ".", "mcp-outlook-token.json");
+const CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET;
+const SESSION_SECRET = process.env.SESSION_SECRET || "changeme";
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const REDIRECT_URI = `${BASE_URL}/auth/callback`;
+const SCOPES = ["Mail.ReadWrite", "offline_access"];
 
-const msalApp = new PublicClientApplication({
-  auth: {
-    clientId: CLIENT_ID,
-    authority: `https://login.microsoftonline.com/${TENANT_ID}`,
-  },
-  cache: {
-    cachePlugin: {
-      beforeCacheAccess: async (ctx) => {
-        if (fs.existsSync(TOKEN_CACHE_FILE)) {
-          ctx.tokenCache.deserialize(fs.readFileSync(TOKEN_CACHE_FILE, "utf8"));
-        }
-      },
-      afterCacheAccess: async (ctx) => {
-        if (ctx.cacheHasChanged) {
-          fs.writeFileSync(TOKEN_CACHE_FILE, ctx.tokenCache.serialize());
-        }
-      },
-    },
-  },
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
 
-// ---------------------------------------------------------------------------
-// Auth helper — device code flow
-// ---------------------------------------------------------------------------
-async function getToken() {
-  const scopes = ["Mail.ReadWrite", "offline_access"];
-
-  const accounts = await msalApp.getTokenCache().getAllAccounts();
-  if (accounts.length > 0) {
-    try {
-      const result = await msalApp.acquireTokenSilent({ scopes, account: accounts[0] });
-      return result.accessToken;
-    } catch (_) { /* fall through to device code */ }
-  }
-
-  const deviceCodeResponse = await msalApp.acquireTokenByDeviceCode({
-    scopes,
-    deviceCodeCallback: (response) => {
-      process.stderr.write(`\n[AUTH REQUIRED] Open ${response.verificationUri} and enter code: ${response.userCode}\n`);
-    },
-  });
-  return deviceCodeResponse.accessToken;
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_tokens (
+      user_id TEXT PRIMARY KEY,
+      token_cache TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
 }
 
-// ---------------------------------------------------------------------------
-// Graph API helper
-// ---------------------------------------------------------------------------
-async function graph(method, path, body) {
-  const token = await getToken();
+function createMsalApp() {
+  return new ConfidentialClientApplication({
+    auth: {
+      clientId: CLIENT_ID,
+      authority: `https://login.microsoftonline.com/${TENANT_ID}`,
+      clientSecret: CLIENT_SECRET,
+    },
+  });
+}
+
+async function getTokenForUser(userId) {
+  const msalApp = createMsalApp();
+  const row = await pool.query("SELECT token_cache FROM user_tokens WHERE user_id = $1", [userId]);
+  if (row.rows.length === 0) throw new Error("User not authenticated");
+
+  const cache = msalApp.getTokenCache();
+  cache.deserialize(row.rows[0].token_cache);
+
+  const accounts = await cache.getAllAccounts();
+  if (!accounts || accounts.length === 0) throw new Error("No accounts in cache");
+
+  const result = await msalApp.acquireTokenSilent({
+    scopes: SCOPES,
+    account: accounts[0],
+  });
+
+  const serialized = cache.serialize();
+  await pool.query(
+    "UPDATE user_tokens SET token_cache = $1, updated_at = NOW() WHERE user_id = $2",
+    [serialized, userId]
+  );
+
+  return result.accessToken;
+}
+
+async function graph(method, path, body, userId) {
+  const token = await getTokenForUser(userId);
   const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
     method,
     headers: {
@@ -72,281 +79,247 @@ async function graph(method, path, body) {
   });
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Graph API ${method} ${path} → ${res.status}: ${err}`);
+    throw new Error(`Graph ${method} ${path} => ${res.status}: ${err}`);
   }
   if (res.status === 204) return null;
   return res.json();
 }
 
-async function getAllChildFolders(folderId) {
-  let url = `/me/mailFolders/${folderId}/childFolders?$top=100`;
-  const folders = [];
-  while (url) {
-    const data = await graph("GET", url);
-    folders.push(...data.value);
-    url = data["@odata.nextLink"]?.replace("https://graph.microsoft.com/v1.0", "") ?? null;
-  }
-  return folders;
+async function getAllFolders(parentPath, userId) {
+  const data = await graph("GET", `/me/mailFolders${parentPath}/childFolders?$top=100`, null, userId);
+  return data.value || [];
 }
 
-// ---------------------------------------------------------------------------
-// MCP Server
-// ---------------------------------------------------------------------------
-const server = new McpServer({
-  name: "mcp-outlook",
-  version: "1.0.0",
+async function getLatestMessageDate(folderId, userId) {
+  const data = await graph(
+    "GET",
+    `/me/mailFolders/${folderId}/messages?$top=1&$select=receivedDateTime&$orderby=receivedDateTime desc`,
+    null,
+    userId
+  );
+  if (data.value && data.value.length > 0) {
+    return new Date(data.value[0].receivedDateTime);
+  }
+  return null;
+}
+
+function createMcpServer(userId) {
+  const server = new McpServer({
+    name: "outlook-mail-tools",
+    version: "2.0.0",
+  });
+
+  server.tool("list_project_folders", "List all Project folders under Inbox/Deals", {}, async () => {
+    try {
+      const inbox = await graph("GET", "/me/mailFolders/Inbox/childFolders?$top=100", null, userId);
+      const deals = inbox.value?.find((f) => f.displayName === "Deals");
+      if (!deals) return { content: [{ type: "text", text: "Deals folder not found" }] };
+
+      const folders = await getAllFolders(`/${deals.id}`, userId);
+      const projects = folders.filter(
+        (f) =>
+          f.displayName.startsWith("Project ") &&
+          !f.displayName.endsWith("- archive") &&
+          !f.displayName.endsWith("- Archive")
+      );
+
+      const lines = projects.map((f) => `${f.displayName} (id: ${f.id})`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+    }
+  });
+
+  server.tool(
+    "rename_mail_folder",
+    "Rename a mail folder by ID",
+    { folderId: z.string(), newName: z.string() },
+    async ({ folderId, newName }) => {
+      try {
+        await graph("PATCH", `/me/mailFolders/${folderId}`, { displayName: newName }, userId);
+        return { content: [{ type: "text", text: `Renamed to: ${newName}` }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+      }
+    }
+  );
+
+  server.tool(
+    "move_mail_folder",
+    "Move a mail folder to a new parent folder",
+    { folderId: z.string(), destinationId: z.string() },
+    async ({ folderId, destinationId }) => {
+      try {
+        await graph("POST", `/me/mailFolders/${folderId}/move`, { destinationId }, userId);
+        return { content: [{ type: "text", text: "Folder moved successfully" }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+      }
+    }
+  );
+
+  server.tool(
+    "run_archive_and_move",
+    "Archive inactive Project folders (no email in 6 weeks) by renaming and moving to zArchive",
+    {},
+    async () => {
+      try {
+        const SIX_WEEKS_MS = 6 * 7 * 24 * 60 * 60 * 1000;
+        const cutoff = new Date(Date.now() - SIX_WEEKS_MS);
+
+        const inbox = await graph("GET", "/me/mailFolders/Inbox/childFolders?$top=100", null, userId);
+        const deals = inbox.value?.find((f) => f.displayName === "Deals");
+        if (!deals) return { content: [{ type: "text", text: "Deals folder not found" }] };
+
+        const folders = await getAllFolders(`/${deals.id}`, userId);
+
+        let zArchive = folders.find((f) => f.displayName === "zArchive");
+        if (!zArchive) {
+          zArchive = await graph(
+            "POST",
+            `/me/mailFolders/${deals.id}/childFolders`,
+            { displayName: "zArchive" },
+            userId
+          );
+        }
+
+        const projects = folders.filter(
+          (f) =>
+            f.displayName.startsWith("Project ") &&
+            !f.displayName.endsWith("- archive") &&
+            !f.displayName.endsWith("- Archive") &&
+            f.id !== zArchive.id
+        );
+
+        const results = [];
+        for (const folder of projects) {
+          const latest = await getLatestMessageDate(folder.id, userId);
+          const inactive = !latest || latest < cutoff;
+
+          if (inactive) {
+            const newName = `${folder.displayName} - Archive`;
+            await graph("PATCH", `/me/mailFolders/${folder.id}`, { displayName: newName }, userId);
+            await graph(
+              "POST",
+              `/me/mailFolders/${folder.id}/move`,
+              { destinationId: zArchive.id },
+              userId
+            );
+            const lastStr = latest ? latest.toISOString().split("T")[0] : "never";
+            results.push(`ARCHIVED: ${folder.displayName} (last email: ${lastStr})`);
+          } else {
+            results.push(`ACTIVE: ${folder.displayName}`);
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: results.length ? results.join("\n") : "No project folders found",
+            },
+          ],
+        };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+      }
+    }
+  );
+
+  return server;
+}
+
+const app = express();
+app.use(express.json());
+app.use(
+  session({
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: false },
+  })
+);
+
+app.get("/", (req, res) => {
+  res.json({ status: "ok", service: "mcp-outlook" });
 });
 
-// Tool: list_project_folders
-server.tool(
-  "list_project_folders",
-  "List all Project [NAME] subfolders under Inbox > Deals, showing whether each has been active in the last 2 months",
-  {},
-  async () => {
-    const inbox = await graph("GET", "/me/mailFolders/Inbox");
-    const inboxChildren = await getAllChildFolders(inbox.id);
-    const deals = inboxChildren.find(f => f.displayName === "Deals");
-    if (!deals) throw new Error("Could not find 'Deals' folder under Inbox");
+app.get("/auth/login", (req, res) => {
+  const state = crypto.randomBytes(16).toString("hex");
+  req.session.oauthState = state;
 
-    const subfolders = await getAllChildFolders(deals.id);
-    const projectFolders = subfolders.filter(f => f.displayName.startsWith("Project "));
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID,
+    response_type: "code",
+    redirect_uri: REDIRECT_URI,
+    scope: SCOPES.join(" "),
+    state,
+    response_mode: "query",
+  });
 
-    const cutoff = new Date();
-    cutoff.setMonth(cutoff.getMonth() - 2);
+  res.redirect(
+    `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize?${params.toString()}`
+  );
+});
 
-    const results = await Promise.all(projectFolders.map(async (folder) => {
-      const msgs = await graph("GET",
-        `/me/mailFolders/${folder.id}/messages?$filter=receivedDateTime ge ${cutoff.toISOString()}&$top=1&$select=receivedDateTime`
-      );
-      return {
-        id: folder.id,
-        name: folder.displayName,
-        totalEmails: folder.totalItemCount,
-        activeLastTwoMonths: msgs.value.length > 0,
-        alreadyArchived: folder.displayName.endsWith("- Archive"),
-      };
-    }));
+app.get("/auth/callback", async (req, res) => {
+  try {
+    const { code, state, error } = req.query;
+    if (error) return res.status(400).send(`Auth error: ${error}`);
+    if (state !== req.session.oauthState) return res.status(400).send("Invalid state");
 
-    return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
-    };
-  }
-);
+    const msalApp = createMsalApp();
+    const result = await msalApp.acquireTokenByCode({
+      code,
+      scopes: SCOPES,
+      redirectUri: REDIRECT_URI,
+    });
 
-// Tool: rename_mail_folder
-server.tool(
-  "rename_mail_folder",
-  "Rename an Outlook mail folder by its ID",
-  { folderId: z.string(), newName: z.string() },
-  async ({ folderId, newName }) => {
-    await graph("PATCH", `/me/mailFolders/${folderId}`, { displayName: newName });
-    return {
-      content: [{ type: "text", text: `Folder renamed to "${newName}"` }],
-    };
-  }
-);
+    const userId = result.account.homeAccountId;
+    const cacheData = msalApp.getTokenCache().serialize();
 
-// Tool: archive_inactive_project_folders
-server.tool(
-  "archive_inactive_project_folders",
-  "Check all Project folders under Inbox > Deals and rename inactive ones (no email in last 2 months) to 'Project [NAME] - Archive'. Skips folders already ending in '- Archive'.",
-  { dryRun: z.coerce.boolean().default(true) },
-  async ({ dryRun }) => {
-    const inbox = await graph("GET", "/me/mailFolders/Inbox");
-    const inboxChildren = await getAllChildFolders(inbox.id);
-    const deals = inboxChildren.find(f => f.displayName === "Deals");
-    if (!deals) throw new Error("Could not find 'Deals' folder under Inbox");
-
-    const subfolders = await getAllChildFolders(deals.id);
-    const projectFolders = subfolders.filter(f =>
-      f.displayName.startsWith("Project ") &&
-      !f.displayName.endsWith("- Archive")
+    await pool.query(
+      `INSERT INTO user_tokens (user_id, token_cache) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET token_cache = $2, updated_at = NOW()`,
+      [userId, cacheData]
     );
 
-    const cutoff = new Date();
-    cutoff.setMonth(cutoff.getMonth() - 2);
-
-    const archived = [];
-    const active = [];
-
-    for (const folder of projectFolders) {
-      const msgs = await graph("GET",
-        `/me/mailFolders/${folder.id}/messages?$filter=receivedDateTime ge ${cutoff.toISOString()}&$top=1&$select=receivedDateTime`
-      );
-
-      if (msgs.value.length > 0) {
-        active.push(folder.displayName);
-      } else {
-        const newName = `${folder.displayName} - Archive`;
-        if (!dryRun) {
-          await graph("PATCH", `/me/mailFolders/${folder.id}`, { displayName: newName });
-        }
-        archived.push({ from: folder.displayName, to: newName });
-      }
-    }
-
-    return {
-      content: [{
-        type: "text", text: JSON.stringify({
-          dryRun,
-          activeCount: active.length,
-          archivedCount: archived.length,
-          activeFolders: active,
-          renamedFolders: archived,
-        }, null, 2)
-      }],
-    };
+    req.session.userId = userId;
+    res.send(`
+      <h2>Authenticated successfully!</h2>
+      <p>Your user ID: <code>${userId}</code></p>
+      <p>MCP endpoint: <code>${BASE_URL}/mcp/${userId}</code></p>
+      <p>Add this URL to your Claude MCP config.</p>
+    `);
+  } catch (e) {
+    res.status(500).send(`Callback error: ${e.message}`);
   }
-);
+});
 
+app.all("/mcp/:userId", async (req, res) => {
+  const { userId } = req.params;
 
-// Tool: move_mail_folder
-server.tool(
-  "move_mail_folder",
-  "Move an Outlook mail folder into a different parent folder. Accepts folder IDs or well-known names (e.g. 'inbox', 'archive', 'deleteditems', 'sentitems'). Use list_project_folders to get folder IDs.",
-  { folderId: z.string(), destinationId: z.string() },
-  async ({ folderId, destinationId }) => {
-    const result = await graph("POST", `/me/mailFolders/${folderId}/move`, { destinationId });
-    return {
-      content: [{ type: "text", text: JSON.stringify({
-        success: true,
-        movedFolder: result.displayName,
-        newId: result.id,
-        parentFolderId: result.parentFolderId,
-      }, null, 2) }],
-    };
+  const row = await pool.query("SELECT user_id FROM user_tokens WHERE user_id = $1", [userId]);
+  if (row.rows.length === 0) {
+    return res.status(401).json({ error: "User not authenticated. Visit /auth/login first." });
   }
-);
 
-// Tool: archive_and_move_inactive_projects
-server.tool(
-  "archive_and_move_inactive_projects",
-  "Finds all Project [NAME] folders under Inbox > Deals with no email activity in the last 6 weeks. Renames each to 'Project [NAME] - archive' and moves it into Inbox > Deals > zArchive. Creates zArchive if it does not exist. Supports dryRun (default true).",
-  { dryRun: z.coerce.boolean().default(true) },
-  async ({ dryRun }) => {
-    // Locate Inbox > Deals
-    const inbox = await graph("GET", "/me/mailFolders/Inbox");
-    const inboxChildren = await getAllChildFolders(inbox.id);
-    const deals = inboxChildren.find(f => f.displayName === "Deals");
-    if (!deals) throw new Error("Could not find 'Deals' folder under Inbox");
+  const server = createMcpServer(userId);
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
-    // Locate or create Deals > zArchive
-    const dealsChildren = await getAllChildFolders(deals.id);
-    let zArchive = dealsChildren.find(f => f.displayName === "zArchive");
-    if (!zArchive) {
-      if (!dryRun) {
-        zArchive = await graph("POST", `/me/mailFolders/${deals.id}/childFolders`, { displayName: "zArchive" });
-      } else {
-        zArchive = { id: "zArchive-would-be-created", displayName: "zArchive" };
-      }
-    }
+  res.on("close", () => transport.close());
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+});
 
-    // 6-week cutoff
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 42);
-
-    // Filter to active Project folders not already archived
-    const projectFolders = dealsChildren.filter(f =>
-      f.displayName.startsWith("Project ") &&
-      !f.displayName.endsWith("- archive") &&
-      !f.displayName.endsWith("- Archive")
-    );
-
-    const toArchive = [];
-    const active = [];
-
-    for (const folder of projectFolders) {
-      const msgs = await graph("GET",
-        `/me/mailFolders/${folder.id}/messages?$filter=receivedDateTime ge ${cutoff.toISOString()}&$top=1&$select=receivedDateTime`
-      );
-
-      if (msgs.value.length > 0) {
-        active.push(folder.displayName);
-      } else {
-        const newName = `${folder.displayName} - archive`;
-        if (!dryRun) {
-          // Step 1: rename
-          await graph("PATCH", `/me/mailFolders/${folder.id}`, { displayName: newName });
-          // Step 2: move to zArchive
-          await graph("POST", `/me/mailFolders/${folder.id}/move`, { destinationId: zArchive.id });
-        }
-        toArchive.push({ from: folder.displayName, to: newName, destination: "Inbox/Deals/zArchive" });
-      }
-    }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify({
-        dryRun,
-        cutoffDate: cutoff.toISOString().split("T")[0],
-        zArchiveCreated: !dealsChildren.find(f => f.displayName === "zArchive") && !dryRun,
-        activeCount: active.length,
-        archivedCount: toArchive.length,
-        activeFolders: active,
-        archivedFolders: toArchive,
-      }, null, 2) }],
-    };
-  }
-);
-
-// Tool: run_archive_and_move
-server.tool(
-  "run_archive_and_move",
-  "LIVE run (no dry run): renames all Project folders under Inbox > Deals with no email in the last 6 weeks to 'Project [NAME] - archive' and moves them to Inbox > Deals > zArchive. Creates zArchive if needed.",
-  {},
-  async () => {
-    const inbox = await graph("GET", "/me/mailFolders/Inbox");
-    const inboxChildren = await getAllChildFolders(inbox.id);
-    const deals = inboxChildren.find(f => f.displayName === "Deals");
-    if (!deals) throw new Error("Could not find 'Deals' folder under Inbox");
-
-    const dealsChildren = await getAllChildFolders(deals.id);
-    let zArchive = dealsChildren.find(f => f.displayName === "zArchive");
-    const zArchiveCreated = !zArchive;
-    if (!zArchive) {
-      zArchive = await graph("POST", `/me/mailFolders/${deals.id}/childFolders`, { displayName: "zArchive" });
-    }
-
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 42);
-
-    const projectFolders = dealsChildren.filter(f =>
-      f.displayName.startsWith("Project ") &&
-      !f.displayName.endsWith("- archive") &&
-      !f.displayName.endsWith("- Archive")
-    );
-
-    const archived = [];
-    const active = [];
-
-    for (const folder of projectFolders) {
-      const msgs = await graph("GET",
-        `/me/mailFolders/${folder.id}/messages?$filter=receivedDateTime ge ${cutoff.toISOString()}&$top=1&$select=receivedDateTime`
-      );
-
-      if (msgs.value.length > 0) {
-        active.push(folder.displayName);
-      } else {
-        const newName = `${folder.displayName} - archive`;
-        await graph("PATCH", `/me/mailFolders/${folder.id}`, { displayName: newName });
-        await graph("POST", `/me/mailFolders/${folder.id}/move`, { destinationId: zArchive.id });
-        archived.push({ from: folder.displayName, to: newName, destination: "Inbox/Deals/zArchive" });
-      }
-    }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify({
-        cutoffDate: cutoff.toISOString().split("T")[0],
-        zArchiveCreated,
-        activeCount: active.length,
-        archivedCount: archived.length,
-        activeFolders: active,
-        archivedFolders: archived,
-      }, null, 2) }],
-    };
-  }
-);
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
-const transport = new StdioServerTransport();
-await server.connect(transport);
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`MCP Outlook server running on port ${PORT}`);
+      console.log(`Auth login: ${BASE_URL}/auth/login`);
+    });
+  })
+  .catch((err) => {
+    console.error("DB init failed:", err);
+    process.exit(1);
+  });
