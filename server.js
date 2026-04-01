@@ -244,6 +244,28 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", service: "mcp-outlook" });
 });
 
+// Temporary debug route - shows raw env var chars to diagnose auth issues
+app.get("/debug", (req, res) => {
+  const cid = process.env.AZURE_CLIENT_ID || "";
+  const tid = process.env.AZURE_TENANT_ID || "";
+  const params = new URLSearchParams({
+    client_id: cid,
+    response_type: "code",
+    redirect_uri: REDIRECT_URI,
+    scope: SCOPES.join(" "),
+    state: "debug",
+    response_mode: "query",
+  });
+  res.json({
+    client_id_length: cid.length,
+    client_id_first4: cid.slice(0, 4),
+    client_id_last4: cid.slice(-4),
+    client_id_charCodes_first3: [...cid.slice(0, 3)].map(c => c.charCodeAt(0)),
+    tenant_id_first4: tid.slice(0, 4),
+    auth_url: `https://login.microsoftonline.com/${tid}/oauth2/v2.0/authorize?${params.toString()}`,
+  });
+});
+
 app.get("/auth/login", (req, res) => {
   const state = crypto.randomBytes(16).toString("hex");
   req.session.oauthState = state;
@@ -312,8 +334,6 @@ app.all("/mcp/:userId", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// Start listening immediately so Railway health checks succeed
-// DB is initialised in the background
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`MCP Outlook server listening on 0.0.0.0:${PORT}`);
   console.log(`Auth: ${BASE_URL}/auth/login`);
