@@ -312,14 +312,17 @@ app.all("/mcp/:userId", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
+// Start listening immediately so Railway health checks succeed
+// DB is initialised in the background
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`MCP Outlook server listening on 0.0.0.0:${PORT}`);
+  console.log(`Auth: ${BASE_URL}/auth/login`);
+  console.log(`DATABASE_URL set: ${!!process.env.DATABASE_URL}`);
+  console.log(`CLIENT_ID set: ${!!CLIENT_ID}`);
+  console.log(`TENANT_ID set: ${!!TENANT_ID}`);
+  console.log(`CLIENT_SECRET set: ${!!CLIENT_SECRET}`);
+});
+
 initDb()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`MCP Outlook server running on port ${PORT}`);
-      console.log(`Auth login: ${BASE_URL}/auth/login`);
-    });
-  })
-  .catch((err) => {
-    console.error("DB init failed:", err);
-    process.exit(1);
-  });
+  .then(() => console.log("DB initialised successfully"))
+  .catch((err) => console.error("DB init failed (non-fatal):", err));
