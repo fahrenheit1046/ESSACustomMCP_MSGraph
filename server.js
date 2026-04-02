@@ -139,7 +139,9 @@ function createMcpServer(userId, userEmail) {
 
   const isAdmin = userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
 
-  // ─── FOLDER TOOLS ────────────────────────────────────────────────────────
+  // ─── FOLDER TOOLS (admin only) ──────────────────────────────────────────
+
+  if (isAdmin) {
 
   server.tool("list_project_folders", "List all Project folders under Inbox/Deals", {}, async () => {
     try {
@@ -252,6 +254,8 @@ function createMcpServer(userId, userEmail) {
       }
     }
   );
+
+  } // end admin folder tools
 
   // ─── EMAIL TOOLS ─────────────────────────────────────────────────────────
 
