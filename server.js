@@ -16,7 +16,7 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "changeme";
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const MS_REDIRECT_URI = `${BASE_URL}/oauth/ms-callback`;
 const LEGACY_REDIRECT_URI = `${BASE_URL}/auth/callback`;
-const SCOPES = ["Mail.ReadWrite", "offline_access"];
+const SCOPES = ["Mail.ReadWrite", "Mail.Send", "offline_access"];
 const ADMIN_EMAIL = "mm@essallp.com";
 
 const pool = new Pool({
@@ -138,7 +138,7 @@ function verifyPKCE(codeVerifier, codeChallenge) {
 }
 
 function createMcpServer(userId, userEmail) {
-  const server = new McpServer({ name: "essa-outlook", version: "3.3.0" });
+  const server = new McpServer({ name: "essa-outlook", version: "3.4.0" });
   const isAdmin = userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
 
   if (isAdmin) {
@@ -304,7 +304,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.3.0" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.4.0" }));
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({ resource: `${BASE_URL}/mcp`, authorization_servers: [BASE_URL] });
@@ -485,7 +485,7 @@ app.get("/auth/callback", async (req, res) => {
 <pre>${mcpUrl}</pre>
 <h2>Step 2 - Add to Claude Desktop</h2>
 <p>Open (or create) the Claude Desktop config file at:</p>
-<div class="step"><strong>Windows:</strong> <code>%APPDATA%\\Claude\\claude_desktop_config.json</code></div>
+<div class="step"><strong>Windows:</strong> <code>%APPDATA%\\\\Claude\\\\claude_desktop_config.json</code></div>
 <div class="step"><strong>Mac:</strong> <code>~/Library/Application Support/Claude/claude_desktop_config.json</code></div>
 <p>Paste the following into the file:</p>
 <pre>${configJson}</pre>
@@ -502,7 +502,7 @@ app.get("/auth/callback", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`ESSA Outlook MCP v3.3 listening on 0.0.0.0:${PORT}`);
+  console.log(`ESSA Outlook MCP v3.4 listening on 0.0.0.0:${PORT}`);
   console.log(`Connector URL: ${BASE_URL}/mcp`);
   console.log(`DCR endpoint: ${BASE_URL}/oauth/register`);
   console.log(`DATABASE_URL: ${!!process.env.DATABASE_URL} | CLIENT_ID: ${!!CLIENT_ID} | TENANT_ID: ${!!TENANT_ID} | SECRET: ${!!CLIENT_SECRET}`);
