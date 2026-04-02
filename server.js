@@ -425,15 +425,20 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
 });
 
 // Step 1 & 2: Claude hits this, we redirect to Microsoft
-app.get("/oauth/authorize", (req, res) => {
+app.get("/oauth/authorize", async (req, res) => {
   const { redirect_uri, state, code_challenge, code_challenge_method, client_id } = req.query;
   if (!redirect_uri || !state) return res.status(400).send("Missing redirect_uri or state");
 
-  // Save the pending auth info — we'll need it after Microsoft redirects back
-  pool.query(
-    "INSERT INTO pending_auth (state, redirect_uri, code_challenge) VALUES ($1, $2, $3) ON CONFLICT (state) DO UPDATE SET redirect_uri=$2, code_challenge=$3, created_at=NOW()",
-    [state, redirect_uri, code_challenge || null]
-  ).catch(console.error);
+  // Save the pending auth info — await so it's definitely written before MS redirects back
+  try {
+    await pool.query(
+      "INSERT INTO pending_auth (state, redirect_uri, code_challenge) VALUES ($1, $2, $3) ON CONFLICT (state) DO UPDATE SET redirect_uri=$2, code_challenge=$3, created_at=NOW()",
+      [state, redirect_uri, code_challenge || null]
+    );
+  } catch (e) {
+    console.error("Failed to save pending_auth:", e);
+    return res.status(500).send("Server error during auth init");
+  }
 
   // Redirect to Microsoft, passing our state through
   const params = new URLSearchParams({
