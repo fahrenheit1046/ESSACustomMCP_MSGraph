@@ -14,9 +14,7 @@ const TENANT_ID = process.env.AZURE_TENANT_ID;
 const CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET || "changeme";
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-// Redirect URI for the OAuth connector flow (Microsoft sends code here)
 const MS_REDIRECT_URI = `${BASE_URL}/oauth/ms-callback`;
-// Legacy redirect URI kept for backwards compat
 const LEGACY_REDIRECT_URI = `${BASE_URL}/auth/callback`;
 const SCOPES = ["Mail.ReadWrite", "offline_access"];
 const ADMIN_EMAIL = "mm@essallp.com";
@@ -148,10 +146,8 @@ function verifyPKCE(codeVerifier, codeChallenge) {
 // ─── MCP SERVER FACTORY ───────────────────────────────────────────────────────
 
 function createMcpServer(userId, userEmail) {
-  const server = new McpServer({ name: "essa-outlook", version: "3.2.0" });
+  const server = new McpServer({ name: "essa-outlook", version: "3.3.0" });
   const isAdmin = userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
-
-  // ── FOLDER TOOLS (admin only) ─────────────────────────────────────────────
 
   if (isAdmin) {
 
@@ -312,8 +308,6 @@ function createMcpServer(userId, userEmail) {
     }
   );
 
-  // ── ADMIN TOOLS (mm@essallp.com only) ────────────────────────────────────
-
   if (isAdmin) {
     server.tool("admin_search_emails", "ADMIN: Search emails in any ESSA user's mailbox (read-only)",
       {
@@ -379,8 +373,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { secure: false } }));
 
-// ── CORS ─────────────────────────────────────────────────────────────────────
-// Required so Claude.ai's browser can fetch OAuth discovery endpoints cross-origin
+// CORS — required for Claude.ai browser-based OAuth discovery
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
@@ -391,23 +384,23 @@ app.use((req, res, next) => {
 });
 
 // Health check
-app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.2.0" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.3.0" }));
 
 // ─── OAUTH 2.0 SERVER (for Claude connector flow) ────────────────────────────
 //
-// Flow:
-//  1. Claude → GET /mcp (no token) → 401 + WWW-Authenticate with resource_metadata URI
-//  2. Claude fetches /.well-known/oauth-protected-resource → finds authorization server
-//  3. Claude fetches /.well-known/oauth-authorization-server → gets auth/token endpoints
-//  4. Claude opens popup → GET /oauth/authorize?redirect_uri=https://claude.ai/...&state=X&code_challenge=Y
-//  5. We save state, redirect to Microsoft login
-//  6. Microsoft → GET /oauth/ms-callback?code=MS_CODE&state=X
-//  7. We exchange MS code for tokens, generate our_auth_code, redirect back to Claude
-//  8. Claude → POST /oauth/token {code: our_auth_code, code_verifier: Z}
-//  9. We verify PKCE, issue Bearer token, Claude uses it on all /mcp requests
+// Full flow with Dynamic Client Registration (DCR):
+//  1. Claude → GET /mcp (no token) → 401 + WWW-Authenticate with resource_metadata
+//  2. Claude → GET /.well-known/oauth-protected-resource → finds authorization server
+//  3. Claude → GET /.well-known/oauth-authorization-server → gets endpoints + registration_endpoint
+//  4. Claude → POST /oauth/register → registers itself, gets a client_id (DCR, RFC 7591)
+//  5. Claude opens popup → GET /oauth/authorize?client_id=X&redirect_uri=https://claude.ai/...&state=Y&code_challenge=Z
+//  6. We save state, redirect to Microsoft login
+//  7. Microsoft → GET /oauth/ms-callback?code=MS_CODE&state=Y
+//  8. We exchange MS code for tokens, generate our_auth_code, redirect back to Claude
+//  9. Claude → POST /oauth/token {code: our_auth_code, code_verifier: W}
+// 10. We verify PKCE, issue Bearer token. Claude uses it on all future /mcp requests.
 
-// OAuth protected resource metadata (RFC 9470 / MCP OAuth 2.1)
-// resource_metadata URI in WWW-Authenticate points here so Claude knows the auth server
+// Protected resource metadata (RFC 9728 / MCP spec)
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({
     resource: `${BASE_URL}/mcp`,
@@ -415,19 +408,36 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
   });
 });
 
-// OAuth authorization server metadata (RFC 8414)
+// Authorization server metadata (RFC 8414) — includes registration_endpoint for DCR
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
     issuer: BASE_URL,
     authorization_endpoint: `${BASE_URL}/oauth/authorize`,
     token_endpoint: `${BASE_URL}/oauth/token`,
+    registration_endpoint: `${BASE_URL}/oauth/register`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code"],
     code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
   });
 });
 
-// Step 4 & 5: Claude opens this; we redirect to Microsoft
+// Dynamic Client Registration (RFC 7591)
+// Claude POSTs its metadata here and gets back a client_id it can use for the auth flow
+app.post("/oauth/register", (req, res) => {
+  const clientId = randomBytes(16).toString("hex");
+  console.log(`DCR: Registered client "${req.body.client_name || "unknown"}" → ${clientId}`);
+  res.status(201).json({
+    client_id: clientId,
+    client_name: req.body.client_name || "Claude",
+    redirect_uris: req.body.redirect_uris || [],
+    grant_types: req.body.grant_types || ["authorization_code"],
+    response_types: req.body.response_types || ["code"],
+    token_endpoint_auth_method: req.body.token_endpoint_auth_method || "none",
+  });
+});
+
+// Authorization endpoint: Claude redirects user here → we redirect to Microsoft
 app.get("/oauth/authorize", async (req, res) => {
   const { redirect_uri, state, code_challenge, code_challenge_method, client_id } = req.query;
   if (!redirect_uri || !state) return res.status(400).send("Missing redirect_uri or state");
@@ -454,7 +464,7 @@ app.get("/oauth/authorize", async (req, res) => {
   res.redirect(`https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize?${params.toString()}`);
 });
 
-// Step 6 & 7: Microsoft redirects here after user logs in
+// Microsoft callback: exchange MS code, redirect back to Claude with our auth code
 app.get("/oauth/ms-callback", async (req, res) => {
   const { code, state, error } = req.query;
   if (error) return res.status(400).send(`Microsoft auth error: ${error}`);
@@ -494,9 +504,9 @@ app.get("/oauth/ms-callback", async (req, res) => {
   }
 });
 
-// Step 8 & 9: Claude exchanges auth code for Bearer token
+// Token exchange: Claude sends our auth code + PKCE verifier, gets Bearer token
 app.post("/oauth/token", async (req, res) => {
-  const { grant_type, code, code_verifier, redirect_uri } = req.body;
+  const { grant_type, code, code_verifier, redirect_uri, client_id } = req.body;
 
   if (grant_type !== "authorization_code") return res.status(400).json({ error: "unsupported_grant_type" });
   if (!code) return res.status(400).json({ error: "missing code" });
@@ -537,12 +547,11 @@ app.post("/oauth/token", async (req, res) => {
 
 // ─── MCP ENDPOINTS ───────────────────────────────────────────────────────────
 
-// Connector-style endpoint: Bearer token auth with RFC 9470 OAuth discovery
+// Connector endpoint: Bearer token auth with RFC 9728 OAuth discovery
 app.all("/mcp", async (req, res) => {
   const authHeader = req.headers.authorization || "";
   const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
 
-  // WWW-Authenticate uses resource_metadata= so MCP clients can discover the OAuth server
   const wwwAuth = `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`;
 
   if (!bearerToken) {
@@ -566,7 +575,7 @@ app.all("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// Legacy per-user endpoint: no auth required — the userId in the URL IS the credential
+// Legacy per-user endpoint
 app.all("/mcp/:userId", async (req, res) => {
   const { userId } = req.params;
   const row = await pool.query("SELECT user_id, user_email FROM user_tokens WHERE user_id = $1", [userId]);
@@ -582,7 +591,6 @@ app.all("/mcp/:userId", async (req, res) => {
 });
 
 // ─── LEGACY AUTH FLOW ────────────────────────────────────────────────────────
-// User visits /auth/login in browser → Microsoft login → success page with config snippet
 
 app.get("/auth/login", (req, res) => {
   const state = randomBytes(16).toString("hex");
@@ -640,7 +648,7 @@ app.get("/auth/callback", async (req, res) => {
 
   <h2>Step 2 &ndash; Add to Claude Desktop</h2>
   <p>Open (or create) the Claude Desktop config file at:</p>
-  <div class="step">&#x1F4BB; <strong>Windows:</strong> <code>%APPDATA%\\Claude\\claude_desktop_config.json</code></div>
+  <div class="step">&#x1F4BB; <strong>Windows:</strong> <code>%APPDATA%\\\\Claude\\\\claude_desktop_config.json</code></div>
   <div class="step">&#x1F34E; <strong>Mac:</strong> <code>~/Library/Application Support/Claude/claude_desktop_config.json</code></div>
 
   <p>Paste the following into the file (merge with any existing content):</p>
@@ -669,9 +677,9 @@ app.get("/auth/callback", async (req, res) => {
 // ─── START ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`ESSA Outlook MCP v3.2 listening on 0.0.0.0:${PORT}`);
+  console.log(`ESSA Outlook MCP v3.3 listening on 0.0.0.0:${PORT}`);
   console.log(`Connector URL: ${BASE_URL}/mcp`);
-  console.log(`Protected resource metadata: ${BASE_URL}/.well-known/oauth-protected-resource`);
+  console.log(`DCR endpoint: ${BASE_URL}/oauth/register`);
   console.log(`DATABASE_URL: ${!!process.env.DATABASE_URL} | CLIENT_ID: ${!!CLIENT_ID} | TENANT_ID: ${!!TENANT_ID} | SECRET: ${!!CLIENT_SECRET}`);
 });
 
