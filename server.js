@@ -416,6 +416,14 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
   });
 });
 
+// OAuth protected resource metadata (MCP OAuth 2.1 discovery)
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  res.json({
+    resource: BASE_URL,
+    authorization_servers: [BASE_URL],
+  });
+});
+
 // Step 1 & 2: Claude hits this, we redirect to Microsoft
 app.get("/oauth/authorize", (req, res) => {
   const { redirect_uri, state, code_challenge, code_challenge_method, client_id } = req.query;
@@ -544,13 +552,17 @@ app.all("/mcp", async (req, res) => {
   const authHeader = req.headers.authorization || "";
   const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
 
+  const wwwAuth = `Bearer realm="${BASE_URL}", error="unauthorized"`;
+
   if (!bearerToken) {
-    return res.status(401).json({ error: "Authorization: Bearer <token> required. Visit /oauth/authorize to authenticate." });
+    res.set("WWW-Authenticate", wwwAuth);
+    return res.status(401).json({ error: "unauthorized", oauth_metadata: `${BASE_URL}/.well-known/oauth-authorization-server` });
   }
 
   const session = await pool.query("SELECT user_id FROM mcp_sessions WHERE access_token = $1", [bearerToken]);
   if (session.rows.length === 0) {
-    return res.status(401).json({ error: "Invalid or expired token. Re-authenticate via /oauth/authorize." });
+    res.set("WWW-Authenticate", wwwAuth);
+    return res.status(401).json({ error: "invalid_token", oauth_metadata: `${BASE_URL}/.well-known/oauth-authorization-server` });
   }
 
   const userId = session.rows[0].user_id;
