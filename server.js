@@ -53,8 +53,6 @@ async function initDb() {
   await pool.query(`DELETE FROM pending_auth WHERE created_at < NOW() - INTERVAL '10 minutes'`);
 }
 
-// ─── MSAL ────────────────────────────────────────────────────────────────────
-
 function createMsalApp() {
   return new ConfidentialClientApplication({
     auth: {
@@ -84,7 +82,7 @@ async function getTokenForUser(userId) {
 
 async function getAppToken() {
   const msalApp = createMsalApp();
-  const result = await msalApp.acquireTokenByClientCredentials({
+  const result = await msalApp.acquireTokenByClientCredential({
     scopes: ["https://graph.microsoft.com/.default"],
   });
   return result.accessToken;
@@ -94,8 +92,6 @@ async function getUserEmail(userId) {
   const row = await pool.query("SELECT user_email FROM user_tokens WHERE user_id = $1", [userId]);
   return row.rows[0]?.user_email || null;
 }
-
-// ─── GRAPH API ───────────────────────────────────────────────────────────────
 
 async function graph(method, path, body, userId) {
   const token = await getTokenForUser(userId);
@@ -135,22 +131,17 @@ async function getLatestMessageDate(folderId, userId) {
   return null;
 }
 
-// ─── PKCE HELPER ─────────────────────────────────────────────────────────────
-
 function verifyPKCE(codeVerifier, codeChallenge) {
   if (!codeChallenge || !codeVerifier) return true;
   const hash = createHash("sha256").update(codeVerifier).digest("base64url");
   return hash === codeChallenge;
 }
 
-// ─── MCP SERVER FACTORY ───────────────────────────────────────────────────────
-
 function createMcpServer(userId, userEmail) {
   const server = new McpServer({ name: "essa-outlook", version: "3.3.0" });
   const isAdmin = userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
 
   if (isAdmin) {
-
   server.tool("list_project_folders", "List all Project folders under Inbox/Deals", {}, async () => {
     try {
       const inbox = await graph("GET", "/me/mailFolders/Inbox/childFolders?$top=100", null, userId);
@@ -165,7 +156,6 @@ function createMcpServer(userId, userEmail) {
       return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
   });
-
   server.tool("rename_mail_folder", "Rename a mail folder by ID",
     { folderId: z.string(), newName: z.string() },
     async ({ folderId, newName }) => {
@@ -175,7 +165,6 @@ function createMcpServer(userId, userEmail) {
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
   );
-
   server.tool("move_mail_folder", "Move a mail folder to a new parent folder",
     { folderId: z.string(), destinationId: z.string() },
     async ({ folderId, destinationId }) => {
@@ -185,10 +174,8 @@ function createMcpServer(userId, userEmail) {
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
   );
-
   server.tool("run_archive_and_move",
-    "Archive inactive Project folders (no email in 6 weeks) by renaming and moving to zArchive",
-    {},
+    "Archive inactive Project folders (no email in 6 weeks) by renaming and moving to zArchive", {},
     async () => {
       try {
         const SIX_WEEKS_MS = 6 * 7 * 24 * 60 * 60 * 1000;
@@ -224,32 +211,19 @@ function createMcpServer(userId, userEmail) {
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
   );
-
   } // end admin folder tools
 
-  // ── EMAIL TOOLS (all users) ───────────────────────────────────────────────
-
   server.tool("send_email", "Send an email from your account",
-    {
-      to: z.string().describe("Recipient email address"),
-      subject: z.string().describe("Email subject"),
-      body: z.string().describe("Email body (plain text)"),
-      cc: z.string().optional().describe("CC email address (optional)"),
-    },
+    { to: z.string().describe("Recipient email address"), subject: z.string().describe("Email subject"), body: z.string().describe("Email body (plain text)"), cc: z.string().optional().describe("CC email address (optional)") },
     async ({ to, subject, body, cc }) => {
       try {
-        const message = {
-          subject,
-          body: { contentType: "Text", content: body },
-          toRecipients: [{ emailAddress: { address: to } }],
-        };
+        const message = { subject, body: { contentType: "Text", content: body }, toRecipients: [{ emailAddress: { address: to } }] };
         if (cc) message.ccRecipients = [{ emailAddress: { address: cc } }];
         await graph("POST", "/me/sendMail", { message, saveToSentItems: true }, userId);
         return { content: [{ type: "text", text: `Email sent to ${to}` }] };
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
   );
-
   server.tool("archive_email", "Move an email to the Archive folder",
     { messageId: z.string().describe("The message ID to archive") },
     async ({ messageId }) => {
@@ -259,50 +233,27 @@ function createMcpServer(userId, userEmail) {
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
   );
-
   server.tool("search_emails", "Search emails in your mailbox",
-    {
-      query: z.string().describe("Search query (e.g. 'from:john@example.com' or keyword)"),
-      folder: z.string().optional().describe("Folder: inbox, sentitems, drafts, archive (default: inbox)"),
-      top: z.string().optional().describe("Number of results (default: 10, max: 50)"),
-    },
+    { query: z.string().describe("Search query (e.g. 'from:john@example.com' or keyword)"), folder: z.string().optional().describe("Folder: inbox, sentitems, drafts, archive (default: inbox)"), top: z.string().optional().describe("Number of results (default: 10, max: 50)") },
     async ({ query, folder, top }) => {
       try {
         const folderName = folder || "inbox";
         const limit = Math.min(parseInt(top || "10", 10), 50);
-        const data = await graph(
-          "GET",
-          `/me/mailFolders/${folderName}/messages?$search="${encodeURIComponent(query)}"&$top=${limit}&$select=id,subject,from,receivedDateTime,bodyPreview`,
-          null, userId
-        );
+        const data = await graph("GET", `/me/mailFolders/${folderName}/messages?$search="${encodeURIComponent(query)}"&$top=${limit}&$select=id,subject,from,receivedDateTime,bodyPreview`, null, userId);
         if (!data.value || data.value.length === 0) return { content: [{ type: "text", text: "No emails found" }] };
-        const lines = data.value.map((m) =>
-          `ID: ${m.id}\nFrom: ${m.from?.emailAddress?.address}\nDate: ${m.receivedDateTime}\nSubject: ${m.subject}\nPreview: ${m.bodyPreview?.slice(0, 100)}\n`
-        );
+        const lines = data.value.map((m) => `ID: ${m.id}\nFrom: ${m.from?.emailAddress?.address}\nDate: ${m.receivedDateTime}\nSubject: ${m.subject}\nPreview: ${m.bodyPreview?.slice(0, 100)}\n`);
         return { content: [{ type: "text", text: lines.join("\n---\n") }] };
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
   );
-
   server.tool("read_email", "Read the full content of an email by message ID",
     { messageId: z.string().describe("The message ID to read") },
     async ({ messageId }) => {
       try {
-        const m = await graph("GET",
-          `/me/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body`,
-          null, userId
-        );
+        const m = await graph("GET", `/me/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body`, null, userId);
         const to = m.toRecipients?.map((r) => r.emailAddress.address).join(", ");
         const cc = m.ccRecipients?.map((r) => r.emailAddress.address).join(", ");
-        const text = [
-          `Subject: ${m.subject}`,
-          `From: ${m.from?.emailAddress?.address}`,
-          `To: ${to}`,
-          cc ? `CC: ${cc}` : null,
-          `Date: ${m.receivedDateTime}`,
-          ``,
-          m.body?.content?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
-        ].filter(Boolean).join("\n");
+        const text = [`Subject: ${m.subject}`, `From: ${m.from?.emailAddress?.address}`, `To: ${to}`, cc ? `CC: ${cc}` : null, `Date: ${m.receivedDateTime}`, ``, m.body?.content?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()].filter(Boolean).join("\n");
         return { content: [{ type: "text", text }] };
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
@@ -310,70 +261,40 @@ function createMcpServer(userId, userEmail) {
 
   if (isAdmin) {
     server.tool("admin_search_emails", "ADMIN: Search emails in any ESSA user's mailbox (read-only)",
-      {
-        userEmail: z.string().describe("The ESSA user's email address to search"),
-        query: z.string().describe("Search query"),
-        top: z.string().optional().describe("Number of results (default: 10, max: 50)"),
-      },
+      { userEmail: z.string().describe("The ESSA user's email address to search"), query: z.string().describe("Search query"), top: z.string().optional().describe("Number of results (default: 10, max: 50)") },
       async ({ userEmail, query, top }) => {
         try {
           const token = await getAppToken();
           const limit = Math.min(parseInt(top || "10", 10), 50);
-          const data = await graphWithToken("GET",
-            `/users/${encodeURIComponent(userEmail)}/messages?$search="${encodeURIComponent(query)}"&$top=${limit}&$select=id,subject,from,receivedDateTime,bodyPreview`,
-            null, token
-          );
-          if (!data.value || data.value.length === 0)
-            return { content: [{ type: "text", text: `No emails found for ${userEmail}` }] };
-          const lines = data.value.map((m) =>
-            `ID: ${m.id}\nFrom: ${m.from?.emailAddress?.address}\nDate: ${m.receivedDateTime}\nSubject: ${m.subject}\nPreview: ${m.bodyPreview?.slice(0, 100)}\n`
-          );
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(userEmail)}/messages?$search="${encodeURIComponent(query)}"&$top=${limit}&$select=id,subject,from,receivedDateTime,bodyPreview`, null, token);
+          if (!data.value || data.value.length === 0) return { content: [{ type: "text", text: `No emails found for ${userEmail}` }] };
+          const lines = data.value.map((m) => `ID: ${m.id}\nFrom: ${m.from?.emailAddress?.address}\nDate: ${m.receivedDateTime}\nSubject: ${m.subject}\nPreview: ${m.bodyPreview?.slice(0, 100)}\n`);
           return { content: [{ type: "text", text: `Results for ${userEmail}:\n\n` + lines.join("\n---\n") }] };
         } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
       }
     );
-
     server.tool("admin_read_email", "ADMIN: Read a specific email from any ESSA user's mailbox (read-only)",
-      {
-        userEmail: z.string().describe("The ESSA user's email address"),
-        messageId: z.string().describe("The message ID to read"),
-      },
+      { userEmail: z.string().describe("The ESSA user's email address"), messageId: z.string().describe("The message ID to read") },
       async ({ userEmail, messageId }) => {
         try {
           const token = await getAppToken();
-          const m = await graphWithToken("GET",
-            `/users/${encodeURIComponent(userEmail)}/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body`,
-            null, token
-          );
+          const m = await graphWithToken("GET", `/users/${encodeURIComponent(userEmail)}/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body`, null, token);
           const to = m.toRecipients?.map((r) => r.emailAddress.address).join(", ");
           const cc = m.ccRecipients?.map((r) => r.emailAddress.address).join(", ");
-          const text = [
-            `[Reading on behalf of ${userEmail}]`,
-            `Subject: ${m.subject}`,
-            `From: ${m.from?.emailAddress?.address}`,
-            `To: ${to}`,
-            cc ? `CC: ${cc}` : null,
-            `Date: ${m.receivedDateTime}`,
-            ``,
-            m.body?.content?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
-          ].filter(Boolean).join("\n");
+          const text = [`[Reading on behalf of ${userEmail}]`, `Subject: ${m.subject}`, `From: ${m.from?.emailAddress?.address}`, `To: ${to}`, cc ? `CC: ${cc}` : null, `Date: ${m.receivedDateTime}`, ``, m.body?.content?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()].filter(Boolean).join("\n");
           return { content: [{ type: "text", text }] };
         } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
       }
     );
   }
-
   return server;
 }
-
-// ─── EXPRESS APP ─────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { secure: false } }));
 
-// CORS — required for Claude.ai browser-based OAuth discovery
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
@@ -383,32 +304,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
 app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.3.0" }));
 
-// ─── OAUTH 2.0 SERVER (for Claude connector flow) ────────────────────────────
-//
-// Full flow with Dynamic Client Registration (DCR):
-//  1. Claude → GET /mcp (no token) → 401 + WWW-Authenticate with resource_metadata
-//  2. Claude → GET /.well-known/oauth-protected-resource → finds authorization server
-//  3. Claude → GET /.well-known/oauth-authorization-server → gets endpoints + registration_endpoint
-//  4. Claude → POST /oauth/register → registers itself, gets a client_id (DCR, RFC 7591)
-//  5. Claude opens popup → GET /oauth/authorize?client_id=X&redirect_uri=https://claude.ai/...&state=Y&code_challenge=Z
-//  6. We save state, redirect to Microsoft login
-//  7. Microsoft → GET /oauth/ms-callback?code=MS_CODE&state=Y
-//  8. We exchange MS code for tokens, generate our_auth_code, redirect back to Claude
-//  9. Claude → POST /oauth/token {code: our_auth_code, code_verifier: W}
-// 10. We verify PKCE, issue Bearer token. Claude uses it on all future /mcp requests.
-
-// Protected resource metadata (RFC 9728 / MCP spec)
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
-  res.json({
-    resource: `${BASE_URL}/mcp`,
-    authorization_servers: [BASE_URL],
-  });
+  res.json({ resource: `${BASE_URL}/mcp`, authorization_servers: [BASE_URL] });
 });
 
-// Authorization server metadata (RFC 8414) — includes registration_endpoint for DCR
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
     issuer: BASE_URL,
@@ -422,11 +323,9 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
   });
 });
 
-// Dynamic Client Registration (RFC 7591)
-// Claude POSTs its metadata here and gets back a client_id it can use for the auth flow
 app.post("/oauth/register", (req, res) => {
   const clientId = randomBytes(16).toString("hex");
-  console.log(`DCR: Registered client "${req.body.client_name || "unknown"}" → ${clientId}`);
+  console.log(`DCR: Registered client "${req.body.client_name || "unknown"}" -> ${clientId}`);
   res.status(201).json({
     client_id: clientId,
     client_name: req.body.client_name || "Claude",
@@ -437,11 +336,9 @@ app.post("/oauth/register", (req, res) => {
   });
 });
 
-// Authorization endpoint: Claude redirects user here → we redirect to Microsoft
 app.get("/oauth/authorize", async (req, res) => {
   const { redirect_uri, state, code_challenge, code_challenge_method, client_id } = req.query;
   if (!redirect_uri || !state) return res.status(400).send("Missing redirect_uri or state");
-
   try {
     await pool.query(
       "INSERT INTO pending_auth (state, redirect_uri, code_challenge) VALUES ($1, $2, $3) ON CONFLICT (state) DO UPDATE SET redirect_uri=$2, code_challenge=$3, created_at=NOW()",
@@ -451,123 +348,83 @@ app.get("/oauth/authorize", async (req, res) => {
     console.error("Failed to save pending_auth:", e);
     return res.status(500).send("Server error during auth init");
   }
-
   const params = new URLSearchParams({
-    client_id: CLIENT_ID,
-    response_type: "code",
-    redirect_uri: MS_REDIRECT_URI,
-    scope: SCOPES.join(" "),
-    state,
-    response_mode: "query",
+    client_id: CLIENT_ID, response_type: "code", redirect_uri: MS_REDIRECT_URI,
+    scope: SCOPES.join(" "), state, response_mode: "query",
   });
-
   res.redirect(`https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize?${params.toString()}`);
 });
 
-// Microsoft callback: exchange MS code, redirect back to Claude with our auth code
 app.get("/oauth/ms-callback", async (req, res) => {
   const { code, state, error } = req.query;
   if (error) return res.status(400).send(`Microsoft auth error: ${error}`);
   if (!code || !state) return res.status(400).send("Missing code or state");
-
   try {
     const pending = await pool.query("SELECT redirect_uri, code_challenge FROM pending_auth WHERE state = $1", [state]);
     if (pending.rows.length === 0) return res.status(400).send("Invalid or expired state");
-
     const { redirect_uri, code_challenge } = pending.rows[0];
-
     const msalApp = createMsalApp();
     const result = await msalApp.acquireTokenByCode({ code, scopes: SCOPES, redirectUri: MS_REDIRECT_URI });
-
     const userId = result.account.homeAccountId;
     const userEmail = result.account.username;
     const cacheData = msalApp.getTokenCache().serialize();
-
     await pool.query(
       `INSERT INTO user_tokens (user_id, user_email, token_cache) VALUES ($1, $2, $3)
        ON CONFLICT (user_id) DO UPDATE SET user_email=$2, token_cache=$3, updated_at=NOW()`,
       [userId, userEmail, cacheData]
     );
-
     const ourAuthCode = randomBytes(32).toString("hex");
-    await pool.query(
-      "UPDATE pending_auth SET our_auth_code = $1 WHERE state = $2",
-      [ourAuthCode, state]
-    );
-
+    await pool.query("UPDATE pending_auth SET our_auth_code = $1 WHERE state = $2", [ourAuthCode, state]);
     const callbackParams = new URLSearchParams({ code: ourAuthCode, state });
     res.redirect(`${redirect_uri}?${callbackParams.toString()}`);
-
   } catch (e) {
     console.error("OAuth MS callback error:", e);
     res.status(500).send(`Auth failed: ${e.message}`);
   }
 });
 
-// Token exchange: Claude sends our auth code + PKCE verifier, gets Bearer token
 app.post("/oauth/token", async (req, res) => {
   const { grant_type, code, code_verifier, redirect_uri, client_id } = req.body;
-
   if (grant_type !== "authorization_code") return res.status(400).json({ error: "unsupported_grant_type" });
   if (!code) return res.status(400).json({ error: "missing code" });
-
   try {
     const pending = await pool.query("SELECT state, code_challenge FROM pending_auth WHERE our_auth_code = $1", [code]);
     if (pending.rows.length === 0) return res.status(400).json({ error: "invalid_grant" });
-
     const { state, code_challenge } = pending.rows[0];
-
     if (!verifyPKCE(code_verifier, code_challenge)) {
       return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
     }
-
     const userRow = await pool.query(
       "SELECT ut.user_id FROM user_tokens ut INNER JOIN pending_auth pa ON pa.state = $1 WHERE ut.updated_at >= pa.created_at ORDER BY ut.updated_at DESC LIMIT 1",
       [state]
     );
-
     if (userRow.rows.length === 0) return res.status(400).json({ error: "invalid_grant", error_description: "User not found" });
-
     const userId = userRow.rows[0].user_id;
     const accessToken = randomBytes(48).toString("hex");
     await pool.query("INSERT INTO mcp_sessions (access_token, user_id) VALUES ($1, $2)", [accessToken, userId]);
     await pool.query("DELETE FROM pending_auth WHERE state = $1", [state]);
-
-    res.json({
-      access_token: accessToken,
-      token_type: "bearer",
-      expires_in: 86400,
-    });
-
+    res.json({ access_token: accessToken, token_type: "bearer", expires_in: 86400 });
   } catch (e) {
     console.error("Token exchange error:", e);
     res.status(500).json({ error: "server_error", error_description: e.message });
   }
 });
 
-// ─── MCP ENDPOINTS ───────────────────────────────────────────────────────────
-
-// Connector endpoint: Bearer token auth with RFC 9728 OAuth discovery
 app.all("/mcp", async (req, res) => {
   const authHeader = req.headers.authorization || "";
   const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
-
   const wwwAuth = `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`;
-
   if (!bearerToken) {
     res.set("WWW-Authenticate", wwwAuth);
     return res.status(401).json({ error: "unauthorized" });
   }
-
   const sessionRow = await pool.query("SELECT user_id FROM mcp_sessions WHERE access_token = $1", [bearerToken]);
   if (sessionRow.rows.length === 0) {
     res.set("WWW-Authenticate", wwwAuth);
     return res.status(401).json({ error: "invalid_token" });
   }
-
   const userId = sessionRow.rows[0].user_id;
   const userEmail = await getUserEmail(userId);
-
   const server = createMcpServer(userId, userEmail);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => transport.close());
@@ -575,7 +432,6 @@ app.all("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// Legacy per-user endpoint
 app.all("/mcp/:userId", async (req, res) => {
   const { userId } = req.params;
   const row = await pool.query("SELECT user_id, user_email FROM user_tokens WHERE user_id = $1", [userId]);
@@ -589,8 +445,6 @@ app.all("/mcp/:userId", async (req, res) => {
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
 });
-
-// ─── LEGACY AUTH FLOW ────────────────────────────────────────────────────────
 
 app.get("/auth/login", (req, res) => {
   const state = randomBytes(16).toString("hex");
@@ -618,63 +472,34 @@ app.get("/auth/callback", async (req, res) => {
       [userId, userEmail, cacheData]
     );
     req.session.userId = userId;
-
     const mcpUrl = `${BASE_URL}/mcp/${userId}`;
     const configJson = JSON.stringify({ mcpServers: { "essa-outlook": { url: mcpUrl } } }, null, 2);
-
     res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>ESSA Outlook MCP &ndash; Setup Complete</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 740px; margin: 40px auto; padding: 0 24px; color: #1a1a1a; line-height: 1.6; }
-    h1 { color: #2e7d32; margin-bottom: 0.25em; }
-    h2 { margin-top: 2em; border-bottom: 1px solid #e0e0e0; padding-bottom: 4px; }
-    code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-size: 0.88em; word-break: break-all; }
-    pre { background: #f5f5f5; border: 1px solid #ddd; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; line-height: 1.55; white-space: pre; }
-    .step { margin: 0.8em 0 0.8em 1.2em; }
-    .note { background: #fff8e1; border-left: 4px solid #f9a825; padding: 12px 16px; border-radius: 3px; margin: 1.2em 0; font-size: 0.92em; }
-    .footer { margin-top: 3em; color: #888; font-size: 0.82em; border-top: 1px solid #eee; padding-top: 1em; }
-  </style>
-</head>
+<html><head><meta charset="utf-8"><title>ESSA Outlook MCP - Setup Complete</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:740px;margin:40px auto;padding:0 24px;color:#1a1a1a;line-height:1.6}h1{color:#2e7d32}h2{margin-top:2em;border-bottom:1px solid #e0e0e0;padding-bottom:4px}code{background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:.88em;word-break:break-all}pre{background:#f5f5f5;border:1px solid #ddd;padding:16px;border-radius:6px;overflow-x:auto;font-size:.85em;line-height:1.55}.step{margin:.8em 0 .8em 1.2em}.note{background:#fff8e1;border-left:4px solid #f9a825;padding:12px 16px;border-radius:3px;margin:1.2em 0;font-size:.92em}.footer{margin-top:3em;color:#888;font-size:.82em;border-top:1px solid #eee;padding-top:1em}</style></head>
 <body>
-  <h1>&#x2705; Authenticated Successfully</h1>
-  <p>Signed in as: <strong>${userEmail}</strong></p>
-
-  <h2>Step 1 &ndash; Your personal MCP endpoint</h2>
-  <p>This URL is unique to your account:</p>
-  <pre>${mcpUrl}</pre>
-
-  <h2>Step 2 &ndash; Add to Claude Desktop</h2>
-  <p>Open (or create) the Claude Desktop config file at:</p>
-  <div class="step">&#x1F4BB; <strong>Windows:</strong> <code>%APPDATA%\\\\Claude\\\\claude_desktop_config.json</code></div>
-  <div class="step">&#x1F34E; <strong>Mac:</strong> <code>~/Library/Application Support/Claude/claude_desktop_config.json</code></div>
-
-  <p>Paste the following into the file (merge with any existing content):</p>
-  <pre>${configJson}</pre>
-
-  <div class="note">
-    <strong>Tip:</strong> If the file already contains an <code>mcpServers</code> block, just add the <code>"essa-outlook"</code> entry inside it &mdash; don't replace the whole file.
-  </div>
-
-  <h2>Step 3 &ndash; Restart Claude Desktop</h2>
-  <div class="step">1. Save the config file.</div>
-  <div class="step">2. Quit Claude Desktop completely and reopen it.</div>
-  <div class="step">3. Look for the <strong>essa-outlook</strong> tools via the hammer &#x1F528; icon in a new chat.</div>
-
-  <div class="footer">
-    This endpoint is unique to your Microsoft account &mdash; do not share it.<br>
-    Need to re-authenticate? Visit <a href="/auth/login">/auth/login</a> again.
-  </div>
-</body>
-</html>`);
+<h1>&#x2705; Authenticated Successfully</h1>
+<p>Signed in as: <strong>${userEmail}</strong></p>
+<h2>Step 1 - Your personal MCP endpoint</h2>
+<p>This URL is unique to your account:</p>
+<pre>${mcpUrl}</pre>
+<h2>Step 2 - Add to Claude Desktop</h2>
+<p>Open (or create) the Claude Desktop config file at:</p>
+<div class="step"><strong>Windows:</strong> <code>%APPDATA%\\Claude\\claude_desktop_config.json</code></div>
+<div class="step"><strong>Mac:</strong> <code>~/Library/Application Support/Claude/claude_desktop_config.json</code></div>
+<p>Paste the following into the file:</p>
+<pre>${configJson}</pre>
+<div class="note"><strong>Tip:</strong> If the file already contains an <code>mcpServers</code> block, just add the <code>"essa-outlook"</code> entry inside it.</div>
+<h2>Step 3 - Restart Claude Desktop</h2>
+<div class="step">1. Save the config file.</div>
+<div class="step">2. Quit Claude Desktop completely and reopen it.</div>
+<div class="step">3. Look for the <strong>essa-outlook</strong> tools via the hammer icon in a new chat.</div>
+<div class="footer">This endpoint is unique to your Microsoft account. Do not share it.<br>Need to re-authenticate? Visit <a href="/auth/login">/auth/login</a> again.</div>
+</body></html>`);
   } catch (e) {
     res.status(500).send(`Callback error: ${e.message}`);
   }
 });
-
-// ─── START ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`ESSA Outlook MCP v3.3 listening on 0.0.0.0:${PORT}`);
