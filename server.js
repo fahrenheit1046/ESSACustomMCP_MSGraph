@@ -111,8 +111,10 @@ async function graphWithToken(method, path, body, token) {
     const err = await res.text();
     throw new Error(`Graph ${method} ${path} => ${res.status}: ${err}`);
   }
-  if (res.status === 204) return null;
-  return res.json();
+  if (res.status === 202 || res.status === 204) return null;
+  const text = await res.text();
+  if (!text) return null;
+  return JSON.parse(text);
 }
 
 async function getAllFolders(parentPath, userId) {
@@ -138,7 +140,7 @@ function verifyPKCE(codeVerifier, codeChallenge) {
 }
 
 function createMcpServer(userId, userEmail) {
-  const server = new McpServer({ name: "essa-outlook", version: "3.4.0" });
+  const server = new McpServer({ name: "essa-outlook", version: "3.5.0" });
   const isAdmin = userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
 
   if (isAdmin) {
@@ -304,7 +306,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.4.0" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.5.0" }));
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({ resource: `${BASE_URL}/mcp`, authorization_servers: [BASE_URL] });
@@ -502,7 +504,7 @@ app.get("/auth/callback", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`ESSA Outlook MCP v3.4 listening on 0.0.0.0:${PORT}`);
+  console.log(`ESSA Outlook MCP v3.5 listening on 0.0.0.0:${PORT}`);
   console.log(`Connector URL: ${BASE_URL}/mcp`);
   console.log(`DCR endpoint: ${BASE_URL}/oauth/register`);
   console.log(`DATABASE_URL: ${!!process.env.DATABASE_URL} | CLIENT_ID: ${!!CLIENT_ID} | TENANT_ID: ${!!TENANT_ID} | SECRET: ${!!CLIENT_SECRET}`);
