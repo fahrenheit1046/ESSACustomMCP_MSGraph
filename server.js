@@ -27,7 +27,6 @@ const pool = new Pool({
 });
 
 async function initDb() {
-  // Core user tokens table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_tokens (
       user_id    TEXT PRIMARY KEY,
@@ -37,8 +36,6 @@ async function initDb() {
     )
   `);
   await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS user_email TEXT`);
-
-  // Temporary store for in-progress OAuth flows
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pending_auth (
       state          TEXT PRIMARY KEY,
@@ -48,8 +45,6 @@ async function initDb() {
       created_at     TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-
-  // Active MCP sessions (Bearer tokens Claude holds)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mcp_sessions (
       access_token TEXT PRIMARY KEY,
@@ -57,8 +52,6 @@ async function initDb() {
       created_at   TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-
-  // Clean up stale pending_auth older than 10 minutes
   await pool.query(`DELETE FROM pending_auth WHERE created_at < NOW() - INTERVAL '10 minutes'`);
 }
 
@@ -78,15 +71,11 @@ async function getTokenForUser(userId) {
   const msalApp = createMsalApp();
   const row = await pool.query("SELECT token_cache FROM user_tokens WHERE user_id = $1", [userId]);
   if (row.rows.length === 0) throw new Error("User not authenticated");
-
   const cache = msalApp.getTokenCache();
   cache.deserialize(row.rows[0].token_cache);
-
   const accounts = await cache.getAllAccounts();
   if (!accounts || accounts.length === 0) throw new Error("No accounts in cache");
-
   const result = await msalApp.acquireTokenSilent({ scopes: SCOPES, account: accounts[0] });
-
   const serialized = cache.serialize();
   await pool.query(
     "UPDATE user_tokens SET token_cache = $1, updated_at = NOW() WHERE user_id = $2",
@@ -151,7 +140,7 @@ async function getLatestMessageDate(folderId, userId) {
 // ─── PKCE HELPER ─────────────────────────────────────────────────────────────
 
 function verifyPKCE(codeVerifier, codeChallenge) {
-  if (!codeChallenge || !codeVerifier) return true; // optional
+  if (!codeChallenge || !codeVerifier) return true;
   const hash = createHash("sha256").update(codeVerifier).digest("base64url");
   return hash === codeChallenge;
 }
@@ -159,7 +148,7 @@ function verifyPKCE(codeVerifier, codeChallenge) {
 // ─── MCP SERVER FACTORY ───────────────────────────────────────────────────────
 
 function createMcpServer(userId, userEmail) {
-  const server = new McpServer({ name: "essa-outlook", version: "3.1.0" });
+  const server = new McpServer({ name: "essa-outlook", version: "3.2.0" });
   const isAdmin = userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
 
   // ── FOLDER TOOLS (admin only) ─────────────────────────────────────────────
@@ -390,21 +379,43 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { secure: false } }));
 
+// ── CORS ─────────────────────────────────────────────────────────────────────
+// Required so Claude.ai's browser can fetch OAuth discovery endpoints cross-origin
+app.use((req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
+  res.set("Access-Control-Allow-Headers", "Authorization, Content-Type, MCP-Protocol-Version");
+  res.set("Access-Control-Expose-Headers", "WWW-Authenticate");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
 // Health check
-app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.1.0" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook", version: "3.2.0" }));
 
 // ─── OAUTH 2.0 SERVER (for Claude connector flow) ────────────────────────────
 //
 // Flow:
-//  1. Claude → GET /oauth/authorize?redirect_uri=https://claude.ai/...&state=X&code_challenge=Y
-//  2. We save {state, redirect_uri, code_challenge} then redirect user to Microsoft login
-//  3. Microsoft → GET /oauth/ms-callback?code=MS_CODE&state=X
-//  4. We exchange MS code for tokens, generate our_auth_code, redirect back to Claude's redirect_uri
-//  5. Claude → POST /oauth/token {code: our_auth_code, code_verifier: Z}
-//  6. We verify PKCE, issue Bearer access_token, store in mcp_sessions
-//  7. Claude uses Bearer token on all future /mcp requests
+//  1. Claude → GET /mcp (no token) → 401 + WWW-Authenticate with resource_metadata URI
+//  2. Claude fetches /.well-known/oauth-protected-resource → finds authorization server
+//  3. Claude fetches /.well-known/oauth-authorization-server → gets auth/token endpoints
+//  4. Claude opens popup → GET /oauth/authorize?redirect_uri=https://claude.ai/...&state=X&code_challenge=Y
+//  5. We save state, redirect to Microsoft login
+//  6. Microsoft → GET /oauth/ms-callback?code=MS_CODE&state=X
+//  7. We exchange MS code for tokens, generate our_auth_code, redirect back to Claude
+//  8. Claude → POST /oauth/token {code: our_auth_code, code_verifier: Z}
+//  9. We verify PKCE, issue Bearer token, Claude uses it on all /mcp requests
 
-// OAuth metadata discovery endpoint
+// OAuth protected resource metadata (RFC 9470 / MCP OAuth 2.1)
+// resource_metadata URI in WWW-Authenticate points here so Claude knows the auth server
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  res.json({
+    resource: `${BASE_URL}/mcp`,
+    authorization_servers: [BASE_URL],
+  });
+});
+
+// OAuth authorization server metadata (RFC 8414)
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
     issuer: BASE_URL,
@@ -416,20 +427,11 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
   });
 });
 
-// OAuth protected resource metadata (MCP OAuth 2.1 discovery)
-app.get("/.well-known/oauth-protected-resource", (req, res) => {
-  res.json({
-    resource: BASE_URL,
-    authorization_servers: [BASE_URL],
-  });
-});
-
-// Step 1 & 2: Claude hits this, we redirect to Microsoft
+// Step 4 & 5: Claude opens this; we redirect to Microsoft
 app.get("/oauth/authorize", async (req, res) => {
   const { redirect_uri, state, code_challenge, code_challenge_method, client_id } = req.query;
   if (!redirect_uri || !state) return res.status(400).send("Missing redirect_uri or state");
 
-  // Save the pending auth info — await so it's definitely written before MS redirects back
   try {
     await pool.query(
       "INSERT INTO pending_auth (state, redirect_uri, code_challenge) VALUES ($1, $2, $3) ON CONFLICT (state) DO UPDATE SET redirect_uri=$2, code_challenge=$3, created_at=NOW()",
@@ -440,7 +442,6 @@ app.get("/oauth/authorize", async (req, res) => {
     return res.status(500).send("Server error during auth init");
   }
 
-  // Redirect to Microsoft, passing our state through
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     response_type: "code",
@@ -453,20 +454,18 @@ app.get("/oauth/authorize", async (req, res) => {
   res.redirect(`https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize?${params.toString()}`);
 });
 
-// Step 3 & 4: Microsoft redirects here after user logs in
+// Step 6 & 7: Microsoft redirects here after user logs in
 app.get("/oauth/ms-callback", async (req, res) => {
   const { code, state, error } = req.query;
   if (error) return res.status(400).send(`Microsoft auth error: ${error}`);
   if (!code || !state) return res.status(400).send("Missing code or state");
 
   try {
-    // Retrieve the pending auth record
     const pending = await pool.query("SELECT redirect_uri, code_challenge FROM pending_auth WHERE state = $1", [state]);
     if (pending.rows.length === 0) return res.status(400).send("Invalid or expired state");
 
     const { redirect_uri, code_challenge } = pending.rows[0];
 
-    // Exchange Microsoft code for tokens
     const msalApp = createMsalApp();
     const result = await msalApp.acquireTokenByCode({ code, scopes: SCOPES, redirectUri: MS_REDIRECT_URI });
 
@@ -474,23 +473,18 @@ app.get("/oauth/ms-callback", async (req, res) => {
     const userEmail = result.account.username;
     const cacheData = msalApp.getTokenCache().serialize();
 
-    // Store or update user tokens
     await pool.query(
       `INSERT INTO user_tokens (user_id, user_email, token_cache) VALUES ($1, $2, $3)
        ON CONFLICT (user_id) DO UPDATE SET user_email=$2, token_cache=$3, updated_at=NOW()`,
       [userId, userEmail, cacheData]
     );
 
-    // Generate our own one-time auth code for Claude to exchange
     const ourAuthCode = randomBytes(32).toString("hex");
-
-    // Update pending_auth with the auth code so we can verify it in /oauth/token
     await pool.query(
       "UPDATE pending_auth SET our_auth_code = $1 WHERE state = $2",
       [ourAuthCode, state]
     );
 
-    // Redirect back to Claude's callback with our code
     const callbackParams = new URLSearchParams({ code: ourAuthCode, state });
     res.redirect(`${redirect_uri}?${callbackParams.toString()}`);
 
@@ -500,7 +494,7 @@ app.get("/oauth/ms-callback", async (req, res) => {
   }
 });
 
-// Step 5 & 6: Claude exchanges our auth code for a Bearer token
+// Step 8 & 9: Claude exchanges auth code for Bearer token
 app.post("/oauth/token", async (req, res) => {
   const { grant_type, code, code_verifier, redirect_uri } = req.body;
 
@@ -508,20 +502,15 @@ app.post("/oauth/token", async (req, res) => {
   if (!code) return res.status(400).json({ error: "missing code" });
 
   try {
-    // Find the pending auth record by our_auth_code
     const pending = await pool.query("SELECT state, code_challenge FROM pending_auth WHERE our_auth_code = $1", [code]);
     if (pending.rows.length === 0) return res.status(400).json({ error: "invalid_grant" });
 
     const { state, code_challenge } = pending.rows[0];
 
-    // Verify PKCE
     if (!verifyPKCE(code_verifier, code_challenge)) {
       return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
     }
 
-    // Find the user_id associated with this auth flow
-    // (stored via the state → user_tokens path in ms-callback)
-    // We look for the most recently updated user whose token was stored around the same time as this state
     const userRow = await pool.query(
       "SELECT ut.user_id FROM user_tokens ut INNER JOIN pending_auth pa ON pa.state = $1 WHERE ut.updated_at >= pa.created_at ORDER BY ut.updated_at DESC LIMIT 1",
       [state]
@@ -530,18 +519,14 @@ app.post("/oauth/token", async (req, res) => {
     if (userRow.rows.length === 0) return res.status(400).json({ error: "invalid_grant", error_description: "User not found" });
 
     const userId = userRow.rows[0].user_id;
-
-    // Generate a Bearer access token
     const accessToken = randomBytes(48).toString("hex");
     await pool.query("INSERT INTO mcp_sessions (access_token, user_id) VALUES ($1, $2)", [accessToken, userId]);
-
-    // Clean up the pending auth record
     await pool.query("DELETE FROM pending_auth WHERE state = $1", [state]);
 
     res.json({
       access_token: accessToken,
       token_type: "bearer",
-      expires_in: 86400, // 24 hours
+      expires_in: 86400,
     });
 
   } catch (e) {
@@ -552,25 +537,26 @@ app.post("/oauth/token", async (req, res) => {
 
 // ─── MCP ENDPOINTS ───────────────────────────────────────────────────────────
 
-// New connector-style endpoint: authenticates via Bearer token
+// Connector-style endpoint: Bearer token auth with RFC 9470 OAuth discovery
 app.all("/mcp", async (req, res) => {
   const authHeader = req.headers.authorization || "";
   const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
 
-  const wwwAuth = `Bearer realm="${BASE_URL}", error="unauthorized"`;
+  // WWW-Authenticate uses resource_metadata= so MCP clients can discover the OAuth server
+  const wwwAuth = `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`;
 
   if (!bearerToken) {
     res.set("WWW-Authenticate", wwwAuth);
-    return res.status(401).json({ error: "unauthorized", oauth_metadata: `${BASE_URL}/.well-known/oauth-authorization-server` });
+    return res.status(401).json({ error: "unauthorized" });
   }
 
-  const session = await pool.query("SELECT user_id FROM mcp_sessions WHERE access_token = $1", [bearerToken]);
-  if (session.rows.length === 0) {
+  const sessionRow = await pool.query("SELECT user_id FROM mcp_sessions WHERE access_token = $1", [bearerToken]);
+  if (sessionRow.rows.length === 0) {
     res.set("WWW-Authenticate", wwwAuth);
-    return res.status(401).json({ error: "invalid_token", oauth_metadata: `${BASE_URL}/.well-known/oauth-authorization-server` });
+    return res.status(401).json({ error: "invalid_token" });
   }
 
-  const userId = session.rows[0].user_id;
+  const userId = sessionRow.rows[0].user_id;
   const userEmail = await getUserEmail(userId);
 
   const server = createMcpServer(userId, userEmail);
@@ -580,7 +566,7 @@ app.all("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// Legacy per-user endpoint: kept for backwards compatibility
+// Legacy per-user endpoint: no auth required — the userId in the URL IS the credential
 app.all("/mcp/:userId", async (req, res) => {
   const { userId } = req.params;
   const row = await pool.query("SELECT user_id, user_email FROM user_tokens WHERE user_id = $1", [userId]);
@@ -595,7 +581,9 @@ app.all("/mcp/:userId", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// Legacy auth flow (kept for backwards compat)
+// ─── LEGACY AUTH FLOW ────────────────────────────────────────────────────────
+// User visits /auth/login in browser → Microsoft login → success page with config snippet
+
 app.get("/auth/login", (req, res) => {
   const state = randomBytes(16).toString("hex");
   req.session.oauthState = state;
@@ -622,7 +610,57 @@ app.get("/auth/callback", async (req, res) => {
       [userId, userEmail, cacheData]
     );
     req.session.userId = userId;
-    res.send(`<h2>Authenticated!</h2><p>Signed in as: <code>${userEmail}</code></p><p>Legacy MCP endpoint: <code>${BASE_URL}/mcp/${userId}</code></p>`);
+
+    const mcpUrl = `${BASE_URL}/mcp/${userId}`;
+    const configJson = JSON.stringify({ mcpServers: { "essa-outlook": { url: mcpUrl } } }, null, 2);
+
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ESSA Outlook MCP &ndash; Setup Complete</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 740px; margin: 40px auto; padding: 0 24px; color: #1a1a1a; line-height: 1.6; }
+    h1 { color: #2e7d32; margin-bottom: 0.25em; }
+    h2 { margin-top: 2em; border-bottom: 1px solid #e0e0e0; padding-bottom: 4px; }
+    code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-size: 0.88em; word-break: break-all; }
+    pre { background: #f5f5f5; border: 1px solid #ddd; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; line-height: 1.55; white-space: pre; }
+    .step { margin: 0.8em 0 0.8em 1.2em; }
+    .note { background: #fff8e1; border-left: 4px solid #f9a825; padding: 12px 16px; border-radius: 3px; margin: 1.2em 0; font-size: 0.92em; }
+    .footer { margin-top: 3em; color: #888; font-size: 0.82em; border-top: 1px solid #eee; padding-top: 1em; }
+  </style>
+</head>
+<body>
+  <h1>&#x2705; Authenticated Successfully</h1>
+  <p>Signed in as: <strong>${userEmail}</strong></p>
+
+  <h2>Step 1 &ndash; Your personal MCP endpoint</h2>
+  <p>This URL is unique to your account:</p>
+  <pre>${mcpUrl}</pre>
+
+  <h2>Step 2 &ndash; Add to Claude Desktop</h2>
+  <p>Open (or create) the Claude Desktop config file at:</p>
+  <div class="step">&#x1F4BB; <strong>Windows:</strong> <code>%APPDATA%\\Claude\\claude_desktop_config.json</code></div>
+  <div class="step">&#x1F34E; <strong>Mac:</strong> <code>~/Library/Application Support/Claude/claude_desktop_config.json</code></div>
+
+  <p>Paste the following into the file (merge with any existing content):</p>
+  <pre>${configJson}</pre>
+
+  <div class="note">
+    <strong>Tip:</strong> If the file already contains an <code>mcpServers</code> block, just add the <code>"essa-outlook"</code> entry inside it &mdash; don't replace the whole file.
+  </div>
+
+  <h2>Step 3 &ndash; Restart Claude Desktop</h2>
+  <div class="step">1. Save the config file.</div>
+  <div class="step">2. Quit Claude Desktop completely and reopen it.</div>
+  <div class="step">3. Look for the <strong>essa-outlook</strong> tools via the hammer &#x1F528; icon in a new chat.</div>
+
+  <div class="footer">
+    This endpoint is unique to your Microsoft account &mdash; do not share it.<br>
+    Need to re-authenticate? Visit <a href="/auth/login">/auth/login</a> again.
+  </div>
+</body>
+</html>`);
   } catch (e) {
     res.status(500).send(`Callback error: ${e.message}`);
   }
@@ -631,9 +669,9 @@ app.get("/auth/callback", async (req, res) => {
 // ─── START ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`ESSA Outlook MCP v3.1 listening on 0.0.0.0:${PORT}`);
+  console.log(`ESSA Outlook MCP v3.2 listening on 0.0.0.0:${PORT}`);
   console.log(`Connector URL: ${BASE_URL}/mcp`);
-  console.log(`OAuth metadata: ${BASE_URL}/.well-known/oauth-authorization-server`);
+  console.log(`Protected resource metadata: ${BASE_URL}/.well-known/oauth-protected-resource`);
   console.log(`DATABASE_URL: ${!!process.env.DATABASE_URL} | CLIENT_ID: ${!!CLIENT_ID} | TENANT_ID: ${!!TENANT_ID} | SECRET: ${!!CLIENT_SECRET}`);
 });
 
