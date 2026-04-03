@@ -11,13 +11,15 @@ import { randomBytes, createHash, createCipheriv, createDecipheriv } from "crypt
 // ============================================================
 // ESSA Custom MCP - Outlook_eMail  v1.0.0
 // Mail-only MCP server with all 16 security fixes from v4.
-// Standard tools (10): search_emails, search_folder_emails,
+// Standard tools (12): search_emails, search_folder_emails,
 //   read_email, send_email, reply_email, reply_all_email,
-//   forward_email, update_email, create_draft, send_draft
-// Admin tools (10): admin_search_emails, admin_search_folder_emails,
+//   forward_email, update_email, create_draft, send_draft,
+//   list_attachments, download_attachment
+// Admin tools (12): admin_search_emails, admin_search_folder_emails,
 //   admin_read_email, admin_send_email, admin_reply_email,
 //   admin_reply_all_email, admin_forward_email, admin_update_email,
-//   admin_create_draft, admin_send_draft
+//   admin_create_draft, admin_send_draft, admin_list_attachments,
+//   admin_download_attachment
 // Graph scopes: Mail.ReadWrite, Mail.Send, User.Read.All,
 //   offline_access
 // ============================================================
@@ -323,6 +325,29 @@ function createMcpServer(userId, userEmail) {
     }
   );
 
+  // ======== ATTACHMENT TOOLS (2) ========
+
+  server.tool("list_attachments", "List all attachments on an email",
+    { messageId: z.string().describe("Email message ID") },
+    async ({ messageId }) => {
+      try {
+        const data = await graph("GET", `/me/messages/${messageId}/attachments?$select=id,name,contentType,size`, null, userId);
+        const atts = (data.value || []).map(a => `ID: ${a.id}\nName: ${a.name}\nType: ${a.contentType}\nSize: ${a.size} bytes`);
+        return { content: [{ type: "text", text: atts.length ? atts.join("\n---\n") : "No attachments" }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
+  server.tool("download_attachment", "Download an email attachment (returns base64 content)",
+    { messageId: z.string().describe("Email message ID"), attachmentId: z.string().describe("Attachment ID from list_attachments") },
+    async ({ messageId, attachmentId }) => {
+      try {
+        const data = await graph("GET", `/me/messages/${messageId}/attachments/${attachmentId}`, null, userId);
+        return { content: [{ type: "text", text: JSON.stringify({ name: data.name, contentType: data.contentType, size: data.size, contentBytes: data.contentBytes }) }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
   // ======== ADMIN MAIL TOOLS (10) ========
   // Gated by isAdmin check. Uses app-level token to access /users/{email}/...
 
@@ -469,6 +494,31 @@ function createMcpServer(userId, userEmail) {
           const token = await getAppToken();
           await graphWithToken("POST", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}/send`, null, token);
           return { content: [{ type: "text", text: `Draft sent from ${targetEmail}` }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    // ======== ADMIN ATTACHMENT TOOLS (2) ========
+
+    server.tool("admin_list_attachments", "ADMIN: List all attachments on an email in any user's mailbox",
+      { userEmail: z.string().describe("Target user email"), messageId: z.string().describe("Email message ID") },
+      async ({ userEmail: targetEmail, messageId }) => {
+        try {
+          const token = await getAppToken();
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}/attachments?$select=id,name,contentType,size`, null, token);
+          const atts = (data.value || []).map(a => `ID: ${a.id}\nName: ${a.name}\nType: ${a.contentType}\nSize: ${a.size} bytes`);
+          return { content: [{ type: "text", text: atts.length ? atts.join("\n---\n") : "No attachments" }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("admin_download_attachment", "ADMIN: Download an attachment from any user's mailbox (returns base64 content)",
+      { userEmail: z.string().describe("Target user email"), messageId: z.string().describe("Email message ID"), attachmentId: z.string().describe("Attachment ID from admin_list_attachments") },
+      async ({ userEmail: targetEmail, messageId, attachmentId }) => {
+        try {
+          const token = await getAppToken();
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}/attachments/${attachmentId}`, null, token);
+          return { content: [{ type: "text", text: JSON.stringify({ name: data.name, contentType: data.contentType, size: data.size, contentBytes: data.contentBytes }) }] };
         } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
       }
     );
