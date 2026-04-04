@@ -11,15 +11,20 @@ import { randomBytes, createHash, createCipheriv, createDecipheriv } from "crypt
 // ============================================================
 // ESSA Custom MCP - Outlook_eMail  v1.0.0
 // Mail-only MCP server with all 16 security fixes from v4.
-// Standard tools (12): search_emails, search_folder_emails,
+// Standard tools (18): search_emails, search_folder_emails,
 //   read_email, send_email, reply_email, reply_all_email,
 //   forward_email, update_email, create_draft, send_draft,
-//   list_attachments, download_attachment
-// Admin tools (12): admin_search_emails, admin_search_folder_emails,
+//   list_attachments, download_attachment,
+//   list_child_folders, get_folder_by_name, create_folder,
+//   rename_folder, move_folder, get_latest_email_in_folder
+// Admin tools (18): admin_search_emails, admin_search_folder_emails,
 //   admin_read_email, admin_send_email, admin_reply_email,
 //   admin_reply_all_email, admin_forward_email, admin_update_email,
 //   admin_create_draft, admin_send_draft, admin_list_attachments,
-//   admin_download_attachment
+//   admin_download_attachment, admin_list_child_folders,
+//   admin_get_folder_by_name, admin_create_folder,
+//   admin_rename_folder, admin_move_folder,
+//   admin_get_latest_email_in_folder
 // Graph scopes: Mail.ReadWrite, Mail.Send, User.Read.All,
 //   offline_access
 // ============================================================
@@ -348,6 +353,96 @@ function createMcpServer(userId, userEmail) {
     }
   );
 
+  // ======== FOLDER MANAGEMENT TOOLS (6) ========
+
+  server.tool("list_child_folders", "List child folders under a parent mail folder with pagination",
+    { parentFolderId: z.string().describe("Parent folder ID or well-known name (e.g. inbox)"), top: z.string().optional().describe("Results per page (default: 50, max: 50)"), skip: z.string().optional().describe("Results to skip for pagination (default: 0)"), nameFilter: z.string().optional().describe("Only return folders whose name starts with this prefix (e.g. Project)") },
+    async ({ parentFolderId, top, skip, nameFilter }) => {
+      try {
+        const limit = Math.min(parseInt(top) || 50, 50);
+        const offset = parseInt(skip) || 0;
+        const filterParam = nameFilter ? `&$filter=startsWith(displayName,'${nameFilter.replace(/'/g, "''")}')` : "";
+        const parent = await graph("GET", `/me/mailFolders/${parentFolderId}?$select=childFolderCount`, null, userId);
+        const data = await graph("GET", `/me/mailFolders/${parentFolderId}/childFolders?$top=${limit}&$skip=${offset}&$orderby=displayName&$select=id,displayName,totalItemCount,childFolderCount${filterParam}`, null, userId);
+        const folders = (data.value || []).map(f => ({ id: f.id, displayName: f.displayName, totalItemCount: f.totalItemCount, childFolderCount: f.childFolderCount }));
+        const totalCount = parent.childFolderCount || 0;
+        const hasMore = offset + folders.length < totalCount;
+        return { content: [{ type: "text", text: JSON.stringify({ folders, totalCount, hasMore }, null, 2) }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
+  server.tool("get_folder_by_name", "Find a folder by exact display name within a parent folder",
+    { parentFolderId: z.string().describe("Parent folder ID or well-known name"), folderName: z.string().describe("Exact display name to match (case-insensitive)") },
+    async ({ parentFolderId, folderName }) => {
+      try {
+        const escaped = folderName.replace(/'/g, "''");
+        const data = await graph("GET", `/me/mailFolders/${parentFolderId}/childFolders?$filter=displayName eq '${escaped}'&$select=id,displayName,totalItemCount,childFolderCount`, null, userId);
+        if (!data.value || data.value.length === 0) return { content: [{ type: "text", text: JSON.stringify({ found: false, folder: null }) }] };
+        const f = data.value[0];
+        return { content: [{ type: "text", text: JSON.stringify({ found: true, folder: { id: f.id, displayName: f.displayName, totalItemCount: f.totalItemCount, childFolderCount: f.childFolderCount } }) }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
+  server.tool("create_folder", "Create a new child folder under a parent folder (checks for duplicates first)",
+    { parentFolderId: z.string().describe("Parent folder ID"), displayName: z.string().describe("Display name for the new folder (e.g. zArchive)") },
+    async ({ parentFolderId, displayName }) => {
+      try {
+        const escaped = displayName.replace(/'/g, "''");
+        const existing = await graph("GET", `/me/mailFolders/${parentFolderId}/childFolders?$filter=displayName eq '${escaped}'&$select=id,displayName`, null, userId);
+        if (existing.value && existing.value.length > 0) {
+          const f = existing.value[0];
+          return { content: [{ type: "text", text: JSON.stringify({ id: f.id, displayName: f.displayName, parentFolderId, created: false }) }] };
+        }
+        const f = await graph("POST", `/me/mailFolders/${parentFolderId}/childFolders`, { displayName }, userId);
+        return { content: [{ type: "text", text: JSON.stringify({ id: f.id, displayName: f.displayName, parentFolderId, created: true }) }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
+  server.tool("rename_folder", "Rename a mail folder",
+    { folderId: z.string().describe("Folder ID to rename"), newDisplayName: z.string().describe("New display name") },
+    async ({ folderId, newDisplayName }) => {
+      try {
+        const before = await graph("GET", `/me/mailFolders/${folderId}?$select=id,displayName`, null, userId);
+        const previousDisplayName = before.displayName;
+        const after = await graph("PATCH", `/me/mailFolders/${folderId}`, { displayName: newDisplayName }, userId);
+        return { content: [{ type: "text", text: JSON.stringify({ id: after.id, displayName: after.displayName, previousDisplayName }) }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
+  server.tool("move_folder", "Move a folder and all its contents to a new parent folder",
+    { folderId: z.string().describe("Folder ID to move"), destinationFolderId: z.string().describe("Destination parent folder ID") },
+    async ({ folderId, destinationFolderId }) => {
+      try {
+        const result = await graph("POST", `/me/mailFolders/${folderId}/move`, { destinationId: destinationFolderId }, userId);
+        return { content: [{ type: "text", text: JSON.stringify({ id: result.id, displayName: result.displayName, parentFolderId: result.parentFolderId }) }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
+  server.tool("get_latest_email_in_folder", "Get the most recent email in a folder (activity check for archive workflow)",
+    { folderId: z.string().describe("Folder ID to check") },
+    async ({ folderId }) => {
+      try {
+        const folder = await graph("GET", `/me/mailFolders/${folderId}?$select=totalItemCount`, null, userId);
+        if (!folder.totalItemCount || folder.totalItemCount === 0) {
+          return { content: [{ type: "text", text: JSON.stringify({ hasEmails: false, latestEmail: null, daysSinceLastEmail: null }) }] };
+        }
+        const data = await graph("GET", `/me/mailFolders/${folderId}/messages?$orderby=receivedDateTime desc&$top=1&$select=id,subject,sender,receivedDateTime`, null, userId);
+        if (!data.value || data.value.length === 0) {
+          return { content: [{ type: "text", text: JSON.stringify({ hasEmails: false, latestEmail: null, daysSinceLastEmail: null }) }] };
+        }
+        const m = data.value[0];
+        const received = new Date(m.receivedDateTime);
+        const daysSince = Math.floor((Date.now() - received.getTime()) / (1000 * 60 * 60 * 24));
+        return { content: [{ type: "text", text: JSON.stringify({ hasEmails: true, latestEmail: { id: m.id, subject: m.subject, sender: m.sender?.emailAddress?.address, receivedDateTime: m.receivedDateTime }, daysSinceLastEmail: daysSince }) }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
   // ======== ADMIN MAIL TOOLS (10) ========
   // Gated by isAdmin check. Uses app-level token to access /users/{email}/...
 
@@ -522,6 +617,102 @@ function createMcpServer(userId, userEmail) {
         } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
       }
     );
+    // ======== ADMIN FOLDER MANAGEMENT TOOLS (6) ========
+
+    server.tool("admin_list_child_folders", "ADMIN: List child folders under a parent folder in any user's mailbox",
+      { userEmail: z.string().describe("Target user email"), parentFolderId: z.string().describe("Parent folder ID or well-known name (e.g. inbox)"), top: z.string().optional().describe("Results per page (default: 50, max: 50)"), skip: z.string().optional().describe("Results to skip for pagination (default: 0)"), nameFilter: z.string().optional().describe("Only return folders whose name starts with this prefix (e.g. Project)") },
+      async ({ userEmail: targetEmail, parentFolderId, top, skip, nameFilter }) => {
+        try {
+          const token = await getAppToken();
+          const limit = Math.min(parseInt(top) || 50, 50);
+          const offset = parseInt(skip) || 0;
+          const filterParam = nameFilter ? `&$filter=startsWith(displayName,'${nameFilter.replace(/'/g, "''")}')` : "";
+          const parent = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${parentFolderId}?$select=childFolderCount`, null, token);
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${parentFolderId}/childFolders?$top=${limit}&$skip=${offset}&$orderby=displayName&$select=id,displayName,totalItemCount,childFolderCount${filterParam}`, null, token);
+          const folders = (data.value || []).map(f => ({ id: f.id, displayName: f.displayName, totalItemCount: f.totalItemCount, childFolderCount: f.childFolderCount }));
+          const totalCount = parent.childFolderCount || 0;
+          const hasMore = offset + folders.length < totalCount;
+          return { content: [{ type: "text", text: JSON.stringify({ folders, totalCount, hasMore }, null, 2) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("admin_get_folder_by_name", "ADMIN: Find a folder by exact name in any user's mailbox",
+      { userEmail: z.string().describe("Target user email"), parentFolderId: z.string().describe("Parent folder ID or well-known name"), folderName: z.string().describe("Exact display name to match (case-insensitive)") },
+      async ({ userEmail: targetEmail, parentFolderId, folderName }) => {
+        try {
+          const token = await getAppToken();
+          const escaped = folderName.replace(/'/g, "''");
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${parentFolderId}/childFolders?$filter=displayName eq '${escaped}'&$select=id,displayName,totalItemCount,childFolderCount`, null, token);
+          if (!data.value || data.value.length === 0) return { content: [{ type: "text", text: JSON.stringify({ found: false, folder: null }) }] };
+          const f = data.value[0];
+          return { content: [{ type: "text", text: JSON.stringify({ found: true, folder: { id: f.id, displayName: f.displayName, totalItemCount: f.totalItemCount, childFolderCount: f.childFolderCount } }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("admin_create_folder", "ADMIN: Create a child folder in any user's mailbox (checks for duplicates first)",
+      { userEmail: z.string().describe("Target user email"), parentFolderId: z.string().describe("Parent folder ID"), displayName: z.string().describe("Display name for the new folder") },
+      async ({ userEmail: targetEmail, parentFolderId, displayName }) => {
+        try {
+          const token = await getAppToken();
+          const escaped = displayName.replace(/'/g, "''");
+          const existing = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${parentFolderId}/childFolders?$filter=displayName eq '${escaped}'&$select=id,displayName`, null, token);
+          if (existing.value && existing.value.length > 0) {
+            const f = existing.value[0];
+            return { content: [{ type: "text", text: JSON.stringify({ id: f.id, displayName: f.displayName, parentFolderId, created: false }) }] };
+          }
+          const f = await graphWithToken("POST", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${parentFolderId}/childFolders`, { displayName }, token);
+          return { content: [{ type: "text", text: JSON.stringify({ id: f.id, displayName: f.displayName, parentFolderId, created: true }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("admin_rename_folder", "ADMIN: Rename a mail folder in any user's mailbox",
+      { userEmail: z.string().describe("Target user email"), folderId: z.string().describe("Folder ID to rename"), newDisplayName: z.string().describe("New display name") },
+      async ({ userEmail: targetEmail, folderId, newDisplayName }) => {
+        try {
+          const token = await getAppToken();
+          const before = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${folderId}?$select=id,displayName`, null, token);
+          const previousDisplayName = before.displayName;
+          const after = await graphWithToken("PATCH", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${folderId}`, { displayName: newDisplayName }, token);
+          return { content: [{ type: "text", text: JSON.stringify({ id: after.id, displayName: after.displayName, previousDisplayName }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("admin_move_folder", "ADMIN: Move a folder in any user's mailbox to a new parent",
+      { userEmail: z.string().describe("Target user email"), folderId: z.string().describe("Folder ID to move"), destinationFolderId: z.string().describe("Destination parent folder ID") },
+      async ({ userEmail: targetEmail, folderId, destinationFolderId }) => {
+        try {
+          const token = await getAppToken();
+          const result = await graphWithToken("POST", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${folderId}/move`, { destinationId: destinationFolderId }, token);
+          return { content: [{ type: "text", text: JSON.stringify({ id: result.id, displayName: result.displayName, parentFolderId: result.parentFolderId }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("admin_get_latest_email_in_folder", "ADMIN: Get the most recent email in a folder in any user's mailbox",
+      { userEmail: z.string().describe("Target user email"), folderId: z.string().describe("Folder ID to check") },
+      async ({ userEmail: targetEmail, folderId }) => {
+        try {
+          const token = await getAppToken();
+          const folder = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${folderId}?$select=totalItemCount`, null, token);
+          if (!folder.totalItemCount || folder.totalItemCount === 0) {
+            return { content: [{ type: "text", text: JSON.stringify({ hasEmails: false, latestEmail: null, daysSinceLastEmail: null }) }] };
+          }
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${folderId}/messages?$orderby=receivedDateTime desc&$top=1&$select=id,subject,sender,receivedDateTime`, null, token);
+          if (!data.value || data.value.length === 0) {
+            return { content: [{ type: "text", text: JSON.stringify({ hasEmails: false, latestEmail: null, daysSinceLastEmail: null }) }] };
+          }
+          const m = data.value[0];
+          const received = new Date(m.receivedDateTime);
+          const daysSince = Math.floor((Date.now() - received.getTime()) / (1000 * 60 * 60 * 24));
+          return { content: [{ type: "text", text: JSON.stringify({ hasEmails: true, latestEmail: { id: m.id, subject: m.subject, sender: m.sender?.emailAddress?.address, receivedDateTime: m.receivedDateTime }, daysSinceLastEmail: daysSince }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
   } // end admin tools
 
   return server;
