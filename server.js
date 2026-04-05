@@ -9,24 +9,29 @@ import { z } from "zod";
 import { randomBytes, createHash, createCipheriv, createDecipheriv } from "crypto";
 
 // ============================================================
-// ESSA Custom MCP - Outlook_eMail  v1.0.0
+// ESSA Custom MCP - Outlook_eMail  v1.1.0
 // Mail-only MCP server with all 16 security fixes from v4.
-// Standard tools (18): search_emails, search_folder_emails,
+// Standard tools (20): search_emails, search_folder_emails,
 //   read_email, send_email, reply_email, reply_all_email,
 //   forward_email, update_email, create_draft, send_draft,
+//   create_category,
 //   list_attachments, download_attachment,
 //   list_child_folders, get_folder_by_name, create_folder,
 //   rename_folder, move_folder, get_latest_email_in_folder
-// Admin tools (18): admin_search_emails, admin_search_folder_emails,
+// Admin tools (20): admin_search_emails, admin_search_folder_emails,
 //   admin_read_email, admin_send_email, admin_reply_email,
 //   admin_reply_all_email, admin_forward_email, admin_update_email,
-//   admin_create_draft, admin_send_draft, admin_list_attachments,
-//   admin_download_attachment, admin_list_child_folders,
-//   admin_get_folder_by_name, admin_create_folder,
-//   admin_rename_folder, admin_move_folder,
+//   admin_create_draft, admin_send_draft, admin_create_category,
+//   admin_list_attachments, admin_download_attachment,
+//   admin_list_child_folders, admin_get_folder_by_name,
+//   admin_create_folder, admin_rename_folder, admin_move_folder,
 //   admin_get_latest_email_in_folder
 // Graph scopes: Mail.ReadWrite, Mail.Send, User.Read.All,
 //   offline_access
+// v1.1.0 changes:
+//   - update_email / admin_update_email: added categories param
+//   - create_category (standard): create named mailbox category
+//   - admin_create_category: create named category for any user
 // ============================================================
 
 const PORT = process.env.PORT || 3000;
@@ -187,16 +192,15 @@ function stripHtml(html) {
 // Fix 10: A new McpServer + transport is created per request.
 // ============================================================
 function createMcpServer(userId, userEmail) {
-  const server = new McpServer({ name: "essa-outlook-email", version: "1.0.0" });
+  const server = new McpServer({ name: "essa-outlook-email", version: "1.1.0" });
   const isAdmin = userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
 
-  // ======== STANDARD MAIL TOOLS (10) ========
+  // ======== STANDARD MAIL TOOLS ========
 
   server.tool("search_emails", "Search emails in your mailbox",
     { query: z.string().describe("Search query (KQL syntax supported)"), folder: z.string().optional().describe("Folder: inbox, sentitems, drafts, archive, junkemail, deleteditems (default: inbox)"), top: z.string().optional().describe("Number of results (default: 10, max: 50)") },
     async ({ query, folder, top }) => {
       try {
-        // Fix 11: Validate folder
         const f = VALID_FOLDERS.includes(folder) ? folder : "inbox";
         const limit = safeTop(top);
         const data = await graph("GET", `/me/mailFolders/${f}/messages?$search="${encodeURIComponent(query)}"&$top=${limit}&$select=id,subject,from,receivedDateTime,bodyPreview,isRead`, null, userId);
@@ -225,10 +229,10 @@ function createMcpServer(userId, userEmail) {
     { messageId: z.string().describe("The message ID to read") },
     async ({ messageId }) => {
       try {
-        const m = await graph("GET", `/me/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead,flag,importance`, null, userId);
+        const m = await graph("GET", `/me/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead,flag,importance,categories`, null, userId);
         const to = m.toRecipients?.map((r) => r.emailAddress.address).join(", ");
         const cc = m.ccRecipients?.map((r) => r.emailAddress.address).join(", ");
-        const text = [`Subject: ${m.subject}`, `From: ${m.from?.emailAddress?.address}`, `To: ${to}`, cc ? `CC: ${cc}` : null, `Date: ${m.receivedDateTime}`, `Read: ${m.isRead}`, `Flag: ${m.flag?.flagStatus || "none"}`, `Importance: ${m.importance || "normal"}`, ``, stripHtml(m.body?.content)].filter(Boolean).join("\n");
+        const text = [`Subject: ${m.subject}`, `From: ${m.from?.emailAddress?.address}`, `To: ${to}`, cc ? `CC: ${cc}` : null, `Date: ${m.receivedDateTime}`, `Read: ${m.isRead}`, `Flag: ${m.flag?.flagStatus || "none"}`, `Importance: ${m.importance || "normal"}`, m.categories?.length ? `Categories: ${m.categories.join(", ")}` : null, ``, stripHtml(m.body?.content)].filter(Boolean).join("\n");
         return { content: [{ type: "text", text }] };
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
@@ -286,9 +290,9 @@ function createMcpServer(userId, userEmail) {
     }
   );
 
-  server.tool("update_email", "Update email properties (mark read/unread, move, flag)",
-    { messageId: z.string().describe("Message ID"), isRead: z.boolean().optional().describe("Mark as read/unread"), flag: z.string().optional().describe("Flag: flagged, notFlagged, complete"), destinationFolderId: z.string().optional().describe("Move to folder ID") },
-    async ({ messageId, isRead, flag, destinationFolderId }) => {
+  server.tool("update_email", "Update email properties (mark read/unread, move, flag, categories)",
+    { messageId: z.string().describe("Message ID"), isRead: z.boolean().optional().describe("Mark as read/unread"), flag: z.string().optional().describe("Flag: flagged, notFlagged, complete"), destinationFolderId: z.string().optional().describe("Move to folder ID"), categories: z.array(z.string()).optional().describe("Category names to apply (must exist in mailbox — use create_category first). Pass [] to clear all categories.") },
+    async ({ messageId, isRead, flag, destinationFolderId, categories }) => {
       try {
         if (destinationFolderId) {
           await graph("POST", `/me/messages/${messageId}/move`, { destinationId: destinationFolderId }, userId);
@@ -296,6 +300,7 @@ function createMcpServer(userId, userEmail) {
         const patch = {};
         if (isRead !== undefined) patch.isRead = isRead;
         if (flag) patch.flag = { flagStatus: flag };
+        if (categories !== undefined) patch.categories = categories;
         if (Object.keys(patch).length > 0) {
           await graph("PATCH", `/me/messages/${messageId}`, patch, userId);
         }
@@ -331,7 +336,24 @@ function createMcpServer(userId, userEmail) {
     }
   );
 
-  // ======== ATTACHMENT TOOLS (2) ========
+  // ======== CATEGORY TOOL ========
+
+  server.tool("create_category", "Create a new named category in your mailbox. Any text is valid as a name. Once created, apply it to emails via update_email. Idempotent — safe to call if the category already exists.",
+    { displayName: z.string().describe("Category name — any text you like, e.g. 'Follow up client' or 'Needs review'"), color: z.string().optional().describe("Color preset: preset0=red, preset1=orange, preset2=brown, preset3=yellow, preset4=green, preset5=teal, preset6=olive, preset7=blue, preset8=purple, preset9=cranberry, preset24=none (default: preset0)") },
+    async ({ displayName, color }) => {
+      try {
+        const existing = await graph("GET", `/me/outlook/masterCategories`, null, userId);
+        const match = (existing.value || []).find(c => c.displayName.toLowerCase() === displayName.toLowerCase());
+        if (match) {
+          return { content: [{ type: "text", text: JSON.stringify({ id: match.id, displayName: match.displayName, color: match.color, created: false }) }] };
+        }
+        const result = await graph("POST", `/me/outlook/masterCategories`, { displayName, color: color || "preset0" }, userId);
+        return { content: [{ type: "text", text: JSON.stringify({ id: result.id, displayName: result.displayName, color: result.color, created: true }) }] };
+      } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+    }
+  );
+
+  // ======== ATTACHMENT TOOLS ========
 
   server.tool("list_attachments", "List all attachments on an email",
     { messageId: z.string().describe("Email message ID") },
@@ -354,7 +376,7 @@ function createMcpServer(userId, userEmail) {
     }
   );
 
-  // ======== FOLDER MANAGEMENT TOOLS (6) ========
+  // ======== FOLDER MANAGEMENT TOOLS ========
 
   server.tool("list_child_folders", "List child folders under a parent mail folder with pagination",
     { parentFolderId: z.string().describe("Parent folder ID or well-known name (e.g. inbox)"), top: z.string().optional().describe("Results per page (default: 50, max: 50)"), skip: z.string().optional().describe("Results to skip for pagination (default: 0)"), nameFilter: z.string().optional().describe("Only return folders whose name starts with this prefix (e.g. Project)") },
@@ -444,10 +466,10 @@ function createMcpServer(userId, userEmail) {
     }
   );
 
-  // ======== ADMIN MAIL TOOLS (10) ========
-  // Gated by isAdmin check. Uses app-level token to access /users/{email}/...
+  // ======== ADMIN TOOLS ========
 
   if (isAdmin) {
+
     server.tool("admin_search_emails", "ADMIN: Search any user's mailbox in the domain",
       { userEmail: z.string().describe("Target user email address"), query: z.string().describe("Search query (KQL syntax)"), folder: z.string().optional().describe("Well-known folder name (default: inbox)"), top: z.string().optional().describe("Number of results (default: 10, max: 50)") },
       async ({ userEmail: targetEmail, query, folder, top }) => {
@@ -483,10 +505,10 @@ function createMcpServer(userId, userEmail) {
       async ({ userEmail: targetEmail, messageId }) => {
         try {
           const token = await getAppToken();
-          const m = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead,flag,importance`, null, token);
+          const m = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead,flag,importance,categories`, null, token);
           const to = m.toRecipients?.map((r) => r.emailAddress.address).join(", ");
           const cc = m.ccRecipients?.map((r) => r.emailAddress.address).join(", ");
-          const text = [`[Admin — reading on behalf of ${targetEmail}]`, `Subject: ${m.subject}`, `From: ${m.from?.emailAddress?.address}`, `To: ${to}`, cc ? `CC: ${cc}` : null, `Date: ${m.receivedDateTime}`, `Read: ${m.isRead}`, `Flag: ${m.flag?.flagStatus || "none"}`, `Importance: ${m.importance || "normal"}`, ``, stripHtml(m.body?.content)].filter(Boolean).join("\n");
+          const text = [`[Admin — reading on behalf of ${targetEmail}]`, `Subject: ${m.subject}`, `From: ${m.from?.emailAddress?.address}`, `To: ${to}`, cc ? `CC: ${cc}` : null, `Date: ${m.receivedDateTime}`, `Read: ${m.isRead}`, `Flag: ${m.flag?.flagStatus || "none"}`, `Importance: ${m.importance || "normal"}`, m.categories?.length ? `Categories: ${m.categories.join(", ")}` : null, ``, stripHtml(m.body?.content)].filter(Boolean).join("\n");
           return { content: [{ type: "text", text }] };
         } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
       }
@@ -547,9 +569,9 @@ function createMcpServer(userId, userEmail) {
       }
     );
 
-    server.tool("admin_update_email", "ADMIN: Update email properties in any user's mailbox (read/unread, flag, move)",
-      { userEmail: z.string().describe("Target user email"), messageId: z.string().describe("Message ID"), isRead: z.boolean().optional().describe("Mark as read/unread"), flag: z.string().optional().describe("Flag: flagged, notFlagged, complete"), destinationFolderId: z.string().optional().describe("Move to folder ID") },
-      async ({ userEmail: targetEmail, messageId, isRead, flag, destinationFolderId }) => {
+    server.tool("admin_update_email", "ADMIN: Update email properties in any user's mailbox (read/unread, flag, move, categories)",
+      { userEmail: z.string().describe("Target user email"), messageId: z.string().describe("Message ID"), isRead: z.boolean().optional().describe("Mark as read/unread"), flag: z.string().optional().describe("Flag: flagged, notFlagged, complete"), destinationFolderId: z.string().optional().describe("Move to folder ID"), categories: z.array(z.string()).optional().describe("Category names to apply (must exist in user's mailbox — use admin_create_category first). Pass [] to clear all categories.") },
+      async ({ userEmail: targetEmail, messageId, isRead, flag, destinationFolderId, categories }) => {
         try {
           const token = await getAppToken();
           if (destinationFolderId) {
@@ -558,6 +580,7 @@ function createMcpServer(userId, userEmail) {
           const patch = {};
           if (isRead !== undefined) patch.isRead = isRead;
           if (flag) patch.flag = { flagStatus: flag };
+          if (categories !== undefined) patch.categories = categories;
           if (Object.keys(patch).length > 0) {
             await graphWithToken("PATCH", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}`, patch, token);
           }
@@ -596,7 +619,25 @@ function createMcpServer(userId, userEmail) {
       }
     );
 
-    // ======== ADMIN ATTACHMENT TOOLS (2) ========
+    // ======== ADMIN CATEGORY TOOL ========
+
+    server.tool("admin_create_category", "ADMIN: Create a new named category in any user's mailbox. Any text is valid as a name. Once created, apply it via admin_update_email. Idempotent — safe to call if the category already exists.",
+      { userEmail: z.string().describe("Target user email"), displayName: z.string().describe("Category name — any text you like, e.g. 'Follow up client' or 'Needs review'"), color: z.string().optional().describe("Color preset: preset0=red, preset1=orange, preset2=brown, preset3=yellow, preset4=green, preset5=teal, preset6=olive, preset7=blue, preset8=purple, preset9=cranberry, preset24=none (default: preset0)") },
+      async ({ userEmail: targetEmail, displayName, color }) => {
+        try {
+          const token = await getAppToken();
+          const existing = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/outlook/masterCategories`, null, token);
+          const match = (existing.value || []).find(c => c.displayName.toLowerCase() === displayName.toLowerCase());
+          if (match) {
+            return { content: [{ type: "text", text: JSON.stringify({ id: match.id, displayName: match.displayName, color: match.color, created: false }) }] };
+          }
+          const result = await graphWithToken("POST", `/users/${encodeURIComponent(targetEmail)}/outlook/masterCategories`, { displayName, color: color || "preset0" }, token);
+          return { content: [{ type: "text", text: JSON.stringify({ id: result.id, displayName: result.displayName, color: result.color, created: true }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    // ======== ADMIN ATTACHMENT TOOLS ========
 
     server.tool("admin_list_attachments", "ADMIN: List all attachments on an email in any user's mailbox",
       { userEmail: z.string().describe("Target user email"), messageId: z.string().describe("Email message ID") },
@@ -620,7 +661,8 @@ function createMcpServer(userId, userEmail) {
         } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
       }
     );
-    // ======== ADMIN FOLDER MANAGEMENT TOOLS (6) ========
+
+    // ======== ADMIN FOLDER MANAGEMENT TOOLS ========
 
     server.tool("admin_list_child_folders", "ADMIN: List child folders under a parent folder in any user's mailbox",
       { userEmail: z.string().describe("Target user email"), parentFolderId: z.string().describe("Parent folder ID or well-known name (e.g. inbox)"), top: z.string().optional().describe("Results per page (default: 50, max: 50)"), skip: z.string().optional().describe("Results to skip for pagination (default: 0)"), nameFilter: z.string().optional().describe("Only return folders whose name starts with this prefix (e.g. Project)") },
@@ -746,7 +788,7 @@ app.use((req, res, next) => {
 });
 
 // --- Health / Metadata ---
-app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook-email", version: "1.0.0" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook-email", version: "1.1.0" }));
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({ resource: `${BASE_URL}/mcp`, authorization_servers: [BASE_URL] });
@@ -997,7 +1039,7 @@ app.use((err, req, res, next) => {
     process.exit(1);
   }
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`ESSA Custom MCP - Outlook_eMail v1.0.0 listening on 0.0.0.0:${PORT}`);
+    console.log(`ESSA Custom MCP - Outlook_eMail v1.1.0 listening on 0.0.0.0:${PORT}`);
     console.log(`Connector: ${BASE_URL}/mcp`);
     console.log(`DCR: ${BASE_URL}/oauth/register`);
     console.log(`ENV: DB=${!!process.env.DATABASE_URL} CLIENT=${!!CLIENT_ID} TENANT=${!!TENANT_ID} SECRET=${!!CLIENT_SECRET} ENCRYPTION=${!!TOKEN_ENCRYPTION_KEY}`);
