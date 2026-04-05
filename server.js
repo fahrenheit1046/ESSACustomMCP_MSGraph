@@ -235,12 +235,13 @@ function createMcpServer(userId, userEmail) {
   );
 
   server.tool("send_email", "Send an email from your account",
-    { to: z.string().describe("Recipient email(s), comma-separated"), subject: z.string().describe("Subject"), body: z.string().describe("Body (plain text)"), cc: z.string().optional().describe("CC email(s), comma-separated"), bcc: z.string().optional().describe("BCC email(s), comma-separated"), importance: z.string().optional().describe("Importance: low, normal, high (default: normal)") },
-    async ({ to, subject, body, cc, bcc, importance }) => {
+    { to: z.string().describe("Recipient email(s), comma-separated"), subject: z.string().describe("Subject"), body: z.string().describe("Body text or HTML"), cc: z.string().optional().describe("CC email(s), comma-separated"), bcc: z.string().optional().describe("BCC email(s), comma-separated"), importance: z.string().optional().describe("Importance: low, normal, high (default: normal)"), contentType: z.string().optional().describe("Body format: Text or HTML (default: Text)") },
+    async ({ to, subject, body, cc, bcc, importance, contentType }) => {
       try {
+        const bodyType = contentType === "HTML" ? "HTML" : "Text";
         const message = {
           subject,
-          body: { contentType: "Text", content: body },
+          body: { contentType: bodyType, content: body },
           toRecipients: to.split(",").map((e) => ({ emailAddress: { address: e.trim() } })),
         };
         if (cc) message.ccRecipients = cc.split(",").map((e) => ({ emailAddress: { address: e.trim() } }));
@@ -304,12 +305,12 @@ function createMcpServer(userId, userEmail) {
   );
 
   server.tool("create_draft", "Create an email draft",
-    { to: z.string().describe("Recipient email(s), comma-separated"), subject: z.string().describe("Subject"), body: z.string().describe("Body"), cc: z.string().optional().describe("CC emails, comma-separated"), bcc: z.string().optional().describe("BCC emails, comma-separated") },
-    async ({ to, subject, body, cc, bcc }) => {
+    { to: z.string().describe("Recipient email(s), comma-separated"), subject: z.string().describe("Subject"), body: z.string().describe("Body text or HTML"), cc: z.string().optional().describe("CC emails, comma-separated"), bcc: z.string().optional().describe("BCC emails, comma-separated"), contentType: z.string().optional().describe("Body format: Text or HTML (default: Text)") },
+    async ({ to, subject, body, cc, bcc, contentType }) => {
       try {
         const msg = {
           subject,
-          body: { contentType: "Text", content: body },
+          body: { contentType: contentType === "HTML" ? "HTML" : "Text", content: body },
           toRecipients: to.split(",").map((e) => ({ emailAddress: { address: e.trim() } })),
         };
         if (cc) msg.ccRecipients = cc.split(",").map((e) => ({ emailAddress: { address: e.trim() } }));
@@ -492,13 +493,14 @@ function createMcpServer(userId, userEmail) {
     );
 
     server.tool("admin_send_email", "ADMIN: Send an email from any user's mailbox",
-      { userEmail: z.string().describe("Sender user email"), to: z.string().describe("Recipient email(s), comma-separated"), subject: z.string().describe("Subject"), body: z.string().describe("Body (plain text)"), cc: z.string().optional().describe("CC email(s)"), bcc: z.string().optional().describe("BCC email(s)") },
-      async ({ userEmail: senderEmail, to, subject, body, cc, bcc }) => {
+      { userEmail: z.string().describe("Sender user email"), to: z.string().describe("Recipient email(s), comma-separated"), subject: z.string().describe("Subject"), body: z.string().describe("Body text or HTML"), cc: z.string().optional().describe("CC email(s)"), bcc: z.string().optional().describe("BCC email(s)"), contentType: z.string().optional().describe("Body format: Text or HTML (default: Text)") },
+      async ({ userEmail: senderEmail, to, subject, body, cc, bcc, contentType }) => {
         try {
           const token = await getAppToken();
+          const bodyType = contentType === "HTML" ? "HTML" : "Text";
           const message = {
             subject,
-            body: { contentType: "Text", content: body },
+            body: { contentType: bodyType, content: body },
             toRecipients: to.split(",").map((e) => ({ emailAddress: { address: e.trim() } })),
           };
           if (cc) message.ccRecipients = cc.split(",").map((e) => ({ emailAddress: { address: e.trim() } }));
@@ -565,13 +567,14 @@ function createMcpServer(userId, userEmail) {
     );
 
     server.tool("admin_create_draft", "ADMIN: Create a draft in any user's mailbox",
-      { userEmail: z.string().describe("Target user email"), to: z.string().describe("Recipient email(s), comma-separated"), subject: z.string().describe("Subject"), body: z.string().describe("Body"), cc: z.string().optional().describe("CC emails"), bcc: z.string().optional().describe("BCC emails") },
-      async ({ userEmail: targetEmail, to, subject, body, cc, bcc }) => {
+      { userEmail: z.string().describe("Target user email"), to: z.string().describe("Recipient email(s), comma-separated"), subject: z.string().describe("Subject"), body: z.string().describe("Body text or HTML"), cc: z.string().optional().describe("CC emails"), bcc: z.string().optional().describe("BCC emails"), contentType: z.string().optional().describe("Body format: Text or HTML (default: Text)") },
+      async ({ userEmail: targetEmail, to, subject, body, cc, bcc, contentType }) => {
         try {
           const token = await getAppToken();
+          const bodyType = contentType === "HTML" ? "HTML" : "Text";
           const msg = {
             subject,
-            body: { contentType: "Text", content: body },
+            body: { contentType: bodyType, content: body },
             toRecipients: to.split(",").map((e) => ({ emailAddress: { address: e.trim() } })),
           };
           if (cc) msg.ccRecipients = cc.split(",").map((e) => ({ emailAddress: { address: e.trim() } }));
