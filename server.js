@@ -949,7 +949,7 @@ app.use((req, res, next) => {
 });
 
 // --- Health / Metadata ---
-app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook-email", version: "1.1.0" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "essa-outlook-email", version: "1.3.0" }));
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({ resource: `${BASE_URL}/mcp`, authorization_servers: [BASE_URL] });
