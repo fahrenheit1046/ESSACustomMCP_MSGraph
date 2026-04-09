@@ -9,7 +9,7 @@ import { z } from "zod";
 import { randomBytes, createHash, createCipheriv, createDecipheriv } from "crypto";
 
 // ============================================================
-// ESSA Custom MCP - Outlook_eMail  v1.2.0
+// ESSA Custom MCP - Outlook_eMail  v1.3.0
 // Mail-only MCP server with all 16 security fixes from v4.
 // Standard tools (20): search_emails, search_folder_emails,
 //   read_email, send_email, reply_email, reply_all_email,
@@ -32,6 +32,13 @@ import { randomBytes, createHash, createCipheriv, createDecipheriv } from "crypt
 //   - update_email / admin_update_email: added categories param
 //   - create_category (standard): create named mailbox category
 //   - admin_create_category: create named category for any user
+// v1.3.0 changes:
+//   - Session TTL increased to 30 days with sliding-window expiry
+//   - Client credentials grant for background/service processes
+//   - 8 read-only svc_ tools: svc_search_emails, svc_search_folder_emails,
+//     svc_read_email, svc_list_attachments, svc_download_attachment,
+//     svc_list_child_folders, svc_get_folder_by_name, svc_get_latest_email_in_folder
+//   - ReauthRequiredError with forceRefresh retry for token refresh failures
 // ============================================================
 
 const PORT = process.env.PORT || 3000;
@@ -41,6 +48,7 @@ const CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const MCP_API_KEY = process.env.MCP_API_KEY;
+const SVC_API_KEY = process.env.SVC_API_KEY;
 const TOKEN_ENCRYPTION_KEY = process.env.TOKEN_ENCRYPTION_KEY;
 const MS_REDIRECT_URI = `${BASE_URL}/oauth/ms-callback`;
 const LEGACY_REDIRECT_URI = `${BASE_URL}/auth/callback`;
@@ -112,9 +120,10 @@ async function initDb() {
   )`);
   await pool.query(`ALTER TABLE pending_auth ADD COLUMN IF NOT EXISTS user_id TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mcp_sessions (
-    access_token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(), last_used TIMESTAMPTZ DEFAULT NOW()
+    access_token TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_type TEXT NOT NULL DEFAULT 'interactive', created_at TIMESTAMPTZ DEFAULT NOW(), last_used TIMESTAMPTZ DEFAULT NOW()
   )`);
   await pool.query(`ALTER TABLE mcp_sessions ADD COLUMN IF NOT EXISTS last_used TIMESTAMPTZ DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE mcp_sessions ADD COLUMN IF NOT EXISTS session_type TEXT NOT NULL DEFAULT 'interactive'`);
   await pool.query(`CREATE TABLE IF NOT EXISTS registered_clients (
     client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
@@ -212,11 +221,13 @@ function stripHtml(html) {
 // MCP Server Factory
 // Fix 10: A new McpServer + transport is created per request.
 // ============================================================
-function createMcpServer(userId, userEmail) {
-  const server = new McpServer({ name: "essa-outlook-email", version: "1.1.0" });
-  const isAdmin = userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+function createMcpServer(userId, userEmail, sessionType = "interactive") {
+  const server = new McpServer({ name: "essa-outlook-email", version: "1.3.0" });
+  const isService = sessionType === "service";
+  const isAdmin = !isService && userEmail && userEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
 
-  // ======== STANDARD MAIL TOOLS ========
+  // ======== STANDARD MAIL TOOLS (interactive sessions only) ========
+  if (!isService) {
 
   server.tool("search_emails", "Search emails in your mailbox",
     { query: z.string().describe("Search query (KQL syntax supported)"), folder: z.string().optional().describe("Folder: inbox, sentitems, drafts, archive, junkemail, deleteditems (default: inbox)"), top: z.string().optional().describe("Number of results (default: 10, max: 50)") },
@@ -486,6 +497,8 @@ function createMcpServer(userId, userEmail) {
       } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
     }
   );
+
+  } // end standard tools (interactive only)
 
   // ======== ADMIN TOOLS ========
 
@@ -781,6 +794,133 @@ function createMcpServer(userId, userEmail) {
 
   } // end admin tools
 
+  // ======== SERVICE (READ-ONLY) TOOLS ========
+  // Available only to service/background sessions authenticated via client_credentials.
+  // These mirror the admin read-only tools but use the svc_ prefix.
+  if (isService) {
+
+    server.tool("svc_search_emails", "SERVICE: Search any user's mailbox (read-only)",
+      { userEmail: z.string().describe("Target user email address"), query: z.string().describe("Search query (KQL syntax)"), folder: z.string().optional().describe("Well-known folder name (default: inbox)"), top: z.string().optional().describe("Number of results (default: 10, max: 50)") },
+      async ({ userEmail: targetEmail, query, folder, top }) => {
+        try {
+          const token = await getAppToken();
+          const f = VALID_FOLDERS.includes(folder) ? folder : "inbox";
+          const limit = safeTop(top);
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${f}/messages?$search="${encodeURIComponent(query)}"&$top=${limit}&$select=id,subject,from,receivedDateTime,bodyPreview,isRead`, null, token);
+          if (!data.value || data.value.length === 0) return { content: [{ type: "text", text: `No emails found for ${targetEmail}` }] };
+          const lines = data.value.map((m) => `ID: ${m.id}\nFrom: ${m.from?.emailAddress?.address}\nDate: ${m.receivedDateTime}\nSubject: ${m.subject}\nRead: ${m.isRead}\nPreview: ${m.bodyPreview?.slice(0, 100)}\n`);
+          return { content: [{ type: "text", text: `Results for ${targetEmail}:\n\n` + lines.join("\n---\n") }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("svc_search_folder_emails", "SERVICE: Search a specific folder in any user's mailbox (read-only)",
+      { userEmail: z.string().describe("Target user email"), folderId: z.string().describe("Mail folder ID"), query: z.string().optional().describe("Search query (omit to list recent)"), top: z.string().optional().describe("Number of results (default: 10, max: 50)") },
+      async ({ userEmail: targetEmail, folderId, query, top }) => {
+        try {
+          const token = await getAppToken();
+          const limit = safeTop(top);
+          const searchParam = query ? `$search="${encodeURIComponent(query)}"&` : "";
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${folderId}/messages?${searchParam}$top=${limit}&$select=id,subject,from,receivedDateTime,bodyPreview,isRead&$orderby=receivedDateTime desc`, null, token);
+          if (!data.value || data.value.length === 0) return { content: [{ type: "text", text: `No emails found for ${targetEmail}` }] };
+          const lines = data.value.map((m) => `ID: ${m.id}\nFrom: ${m.from?.emailAddress?.address}\nDate: ${m.receivedDateTime}\nSubject: ${m.subject}\nRead: ${m.isRead}\nPreview: ${m.bodyPreview?.slice(0, 100)}\n`);
+          return { content: [{ type: "text", text: `Results for ${targetEmail}:\n\n` + lines.join("\n---\n") }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("svc_read_email", "SERVICE: Read a specific email from any user's mailbox (read-only)",
+      { userEmail: z.string().describe("Target user email"), messageId: z.string().describe("Message ID") },
+      async ({ userEmail: targetEmail, messageId }) => {
+        try {
+          const token = await getAppToken();
+          const m = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead,flag,importance,categories`, null, token);
+          const to = m.toRecipients?.map((r) => r.emailAddress.address).join(", ");
+          const cc = m.ccRecipients?.map((r) => r.emailAddress.address).join(", ");
+          const text = [`[Service — reading ${targetEmail}]`, `Subject: ${m.subject}`, `From: ${m.from?.emailAddress?.address}`, `To: ${to}`, cc ? `CC: ${cc}` : null, `Date: ${m.receivedDateTime}`, `Read: ${m.isRead}`, `Flag: ${m.flag?.flagStatus || "none"}`, `Importance: ${m.importance || "normal"}`, m.categories?.length ? `Categories: ${m.categories.join(", ")}` : null, ``, stripHtml(m.body?.content)].filter(Boolean).join("\n");
+          return { content: [{ type: "text", text }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("svc_list_attachments", "SERVICE: List all attachments on an email in any user's mailbox (read-only)",
+      { userEmail: z.string().describe("Target user email"), messageId: z.string().describe("Email message ID") },
+      async ({ userEmail: targetEmail, messageId }) => {
+        try {
+          const token = await getAppToken();
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}/attachments?$select=id,name,contentType,size`, null, token);
+          const atts = (data.value || []).map(a => `ID: ${a.id}\nName: ${a.name}\nType: ${a.contentType}\nSize: ${a.size} bytes`);
+          return { content: [{ type: "text", text: atts.length ? atts.join("\n---\n") : "No attachments" }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("svc_download_attachment", "SERVICE: Download an attachment from any user's mailbox (read-only, returns base64)",
+      { userEmail: z.string().describe("Target user email"), messageId: z.string().describe("Email message ID"), attachmentId: z.string().describe("Attachment ID from svc_list_attachments") },
+      async ({ userEmail: targetEmail, messageId, attachmentId }) => {
+        try {
+          const token = await getAppToken();
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/messages/${messageId}/attachments/${attachmentId}`, null, token);
+          return { content: [{ type: "text", text: JSON.stringify({ name: data.name, contentType: data.contentType, size: data.size, contentBytes: data.contentBytes }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("svc_list_child_folders", "SERVICE: List child folders under a parent folder in any user's mailbox (read-only)",
+      { userEmail: z.string().describe("Target user email"), parentFolderId: z.string().describe("Parent folder ID or well-known name (e.g. inbox)"), top: z.string().optional().describe("Results per page (default: 50, max: 50)"), skip: z.string().optional().describe("Results to skip for pagination (default: 0)"), nameFilter: z.string().optional().describe("Only return folders whose name starts with this prefix") },
+      async ({ userEmail: targetEmail, parentFolderId, top, skip, nameFilter }) => {
+        try {
+          const token = await getAppToken();
+          const limit = Math.min(parseInt(top) || 50, 50);
+          const offset = parseInt(skip) || 0;
+          const filterParam = nameFilter ? `&$filter=startsWith(displayName,'${nameFilter.replace(/'/g, "''")}')` : "";
+          const parent = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${parentFolderId}?$select=childFolderCount`, null, token);
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${parentFolderId}/childFolders?$top=${limit}&$skip=${offset}&$orderby=displayName&$select=id,displayName,totalItemCount,childFolderCount${filterParam}`, null, token);
+          const folders = (data.value || []).map(f => ({ id: f.id, displayName: f.displayName, totalItemCount: f.totalItemCount, childFolderCount: f.childFolderCount }));
+          const totalCount = parent.childFolderCount || 0;
+          const hasMore = offset + folders.length < totalCount;
+          return { content: [{ type: "text", text: JSON.stringify({ folders, totalCount, hasMore }, null, 2) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("svc_get_folder_by_name", "SERVICE: Find a folder by exact name in any user's mailbox (read-only)",
+      { userEmail: z.string().describe("Target user email"), parentFolderId: z.string().describe("Parent folder ID or well-known name"), folderName: z.string().describe("Exact display name to match (case-insensitive)") },
+      async ({ userEmail: targetEmail, parentFolderId, folderName }) => {
+        try {
+          const token = await getAppToken();
+          const escaped = folderName.replace(/'/g, "''");
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${parentFolderId}/childFolders?$filter=displayName eq '${escaped}'&$select=id,displayName,totalItemCount,childFolderCount`, null, token);
+          if (!data.value || data.value.length === 0) return { content: [{ type: "text", text: JSON.stringify({ found: false, folder: null }) }] };
+          const f = data.value[0];
+          return { content: [{ type: "text", text: JSON.stringify({ found: true, folder: { id: f.id, displayName: f.displayName, totalItemCount: f.totalItemCount, childFolderCount: f.childFolderCount } }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+    server.tool("svc_get_latest_email_in_folder", "SERVICE: Get the most recent email in a folder in any user's mailbox (read-only)",
+      { userEmail: z.string().describe("Target user email"), folderId: z.string().describe("Folder ID to check") },
+      async ({ userEmail: targetEmail, folderId }) => {
+        try {
+          const token = await getAppToken();
+          const folder = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${folderId}?$select=totalItemCount`, null, token);
+          if (!folder.totalItemCount || folder.totalItemCount === 0) {
+            return { content: [{ type: "text", text: JSON.stringify({ hasEmails: false, latestEmail: null, daysSinceLastEmail: null }) }] };
+          }
+          const data = await graphWithToken("GET", `/users/${encodeURIComponent(targetEmail)}/mailFolders/${folderId}/messages?$orderby=receivedDateTime desc&$top=1&$select=id,subject,sender,receivedDateTime`, null, token);
+          if (!data.value || data.value.length === 0) {
+            return { content: [{ type: "text", text: JSON.stringify({ hasEmails: false, latestEmail: null, daysSinceLastEmail: null }) }] };
+          }
+          const m = data.value[0];
+          const received = new Date(m.receivedDateTime);
+          const daysSince = Math.floor((Date.now() - received.getTime()) / (1000 * 60 * 60 * 24));
+          return { content: [{ type: "text", text: JSON.stringify({ hasEmails: true, latestEmail: { id: m.id, subject: m.subject, sender: m.sender?.emailAddress?.address, receivedDateTime: m.receivedDateTime }, daysSinceLastEmail: daysSince }) }] };
+        } catch (e) { return { content: [{ type: "text", text: `Error: ${e.message}` }] }; }
+      }
+    );
+
+  } // end service tools
+
   return server;
 }
 
@@ -916,7 +1056,30 @@ app.get("/oauth/ms-callback", async (req, res) => {
 
 // --- Token Exchange ---
 app.post("/oauth/token", async (req, res) => {
-  const { grant_type, code, code_verifier } = req.body;
+  const { grant_type, code, code_verifier, client_id: reqClientId, client_secret: reqClientSecret } = req.body;
+
+  // --- Client Credentials grant (for background/service processes) ---
+  if (grant_type === "client_credentials") {
+    if (!SVC_API_KEY) return res.status(400).json({ error: "server_error", error_description: "Service auth not configured" });
+    if (!reqClientSecret || reqClientSecret !== SVC_API_KEY) {
+      return res.status(401).json({ error: "invalid_client", error_description: "Invalid service credentials" });
+    }
+    try {
+      const accessToken = randomBytes(48).toString("hex");
+      const svcUserId = "service-account";
+      await pool.query(
+        "INSERT INTO mcp_sessions (access_token, user_id, session_type) VALUES ($1, $2, $3)",
+        [accessToken, svcUserId, "service"]
+      );
+      console.log("Service session created");
+      return res.json({ access_token: accessToken, token_type: "bearer", expires_in: SESSION_TTL_HOURS * 3600 });
+    } catch (e) {
+      console.error("Service token error:", e);
+      return res.status(500).json({ error: "server_error", error_description: e.message });
+    }
+  }
+
+  // --- Authorization Code grant (interactive OAuth flow) ---
   if (grant_type !== "authorization_code") return res.status(400).json({ error: "unsupported_grant_type" });
   if (!code) return res.status(400).json({ error: "missing code" });
   try {
@@ -953,7 +1116,7 @@ app.all("/mcp", async (req, res) => {
   }
   // Fix 7: Check session expiry (sliding window based on last_used)
   const sessionRow = await pool.query(
-    `SELECT user_id FROM mcp_sessions WHERE access_token = $1 AND last_used > NOW() - INTERVAL '${SESSION_TTL_HOURS} hours'`,
+    `SELECT user_id, session_type FROM mcp_sessions WHERE access_token = $1 AND last_used > NOW() - INTERVAL '${SESSION_TTL_HOURS} hours'`,
     [bearerToken]
   );
   if (sessionRow.rows.length === 0) {
@@ -961,11 +1124,12 @@ app.all("/mcp", async (req, res) => {
     return res.status(401).json({ error: "invalid_token" });
   }
   const userId = sessionRow.rows[0].user_id;
+  const sessionType = sessionRow.rows[0].session_type || "interactive";
   // Update last_used timestamp for sliding-window expiry
   await pool.query("UPDATE mcp_sessions SET last_used = NOW() WHERE access_token = $1", [bearerToken]);
   try {
-    const userEmail = await getUserEmail(userId);
-    const server = createMcpServer(userId, userEmail);
+    const userEmail = sessionType === "service" ? null : await getUserEmail(userId);
+    const server = createMcpServer(userId, userEmail, sessionType);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => transport.close());
     await server.connect(transport);
@@ -1072,9 +1236,9 @@ app.use((err, req, res, next) => {
     process.exit(1);
   }
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`ESSA Custom MCP - Outlook_eMail v1.2.0 listening on 0.0.0.0:${PORT}`);
+    console.log(`ESSA Custom MCP - Outlook_eMail v1.3.0 listening on 0.0.0.0:${PORT}`);
     console.log(`Connector: ${BASE_URL}/mcp`);
     console.log(`DCR: ${BASE_URL}/oauth/register`);
-    console.log(`ENV: DB=${!!process.env.DATABASE_URL} CLIENT=${!!CLIENT_ID} TENANT=${!!TENANT_ID} SECRET=${!!CLIENT_SECRET} ENCRYPTION=${!!TOKEN_ENCRYPTION_KEY}`);
+    console.log(`ENV: DB=${!!process.env.DATABASE_URL} CLIENT=${!!CLIENT_ID} TENANT=${!!TENANT_ID} SECRET=${!!CLIENT_SECRET} ENCRYPTION=${!!TOKEN_ENCRYPTION_KEY} SVC_KEY=${!!SVC_API_KEY}`);
   });
 })();
