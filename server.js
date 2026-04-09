@@ -9,7 +9,7 @@ import { z } from "zod";
 import { randomBytes, createHash, createCipheriv, createDecipheriv } from "crypto";
 
 // ============================================================
-// ESSA Custom MCP - Outlook_eMail  v1.1.0
+// ESSA Custom MCP - Outlook_eMail  v1.2.0
 // Mail-only MCP server with all 16 security fixes from v4.
 // Standard tools (20): search_emails, search_folder_emails,
 //   read_email, send_email, reply_email, reply_all_email,
@@ -28,7 +28,7 @@ import { randomBytes, createHash, createCipheriv, createDecipheriv } from "crypt
 //   admin_get_latest_email_in_folder
 // Graph scopes: Mail.ReadWrite, Mail.Send, User.Read.All,
 //   offline_access
-// v1.1.0 changes:
+// v1.2.0 changes:
 //   - update_email / admin_update_email: added categories param
 //   - create_category (standard): create named mailbox category
 //   - admin_create_category: create named category for any user
@@ -47,7 +47,7 @@ const LEGACY_REDIRECT_URI = `${BASE_URL}/auth/callback`;
 const ADMIN_EMAIL = "mm@essallp.com";
 const ALLOWED_REDIRECT_URIS = ["https://claude.ai/api/mcp/auth_callback"];
 const VALID_FOLDERS = ["inbox", "sentitems", "drafts", "archive", "junkemail", "deleteditems"];
-const SESSION_TTL_HOURS = 24;
+const SESSION_TTL_HOURS = 720; // 30 days
 
 // Fix 4: SESSION_SECRET is required — no fallback
 if (!SESSION_SECRET) {
@@ -112,14 +112,15 @@ async function initDb() {
   )`);
   await pool.query(`ALTER TABLE pending_auth ADD COLUMN IF NOT EXISTS user_id TEXT`);
   await pool.query(`CREATE TABLE IF NOT EXISTS mcp_sessions (
-    access_token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW()
+    access_token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(), last_used TIMESTAMPTZ DEFAULT NOW()
   )`);
+  await pool.query(`ALTER TABLE mcp_sessions ADD COLUMN IF NOT EXISTS last_used TIMESTAMPTZ DEFAULT NOW()`);
   await pool.query(`CREATE TABLE IF NOT EXISTS registered_clients (
     client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
   await pool.query(`DELETE FROM pending_auth WHERE created_at < NOW() - INTERVAL '10 minutes'`);
-  await pool.query(`DELETE FROM mcp_sessions WHERE created_at < NOW() - INTERVAL '${SESSION_TTL_HOURS} hours'`);
-  await pool.query(`DELETE FROM registered_clients WHERE created_at < NOW() - INTERVAL '24 hours'`);
+  await pool.query(`DELETE FROM mcp_sessions WHERE last_used < NOW() - INTERVAL '${SESSION_TTL_HOURS} hours'`);
+  await pool.query(`DELETE FROM registered_clients WHERE created_at < NOW() - INTERVAL '${SESSION_TTL_HOURS} hours'`);
 }
 
 // --- MSAL ---
@@ -129,17 +130,37 @@ function createMsalApp() {
   });
 }
 
+// Custom error class to signal that re-authentication is needed
+class ReauthRequiredError extends Error {
+  constructor(message) { super(message); this.name = "ReauthRequiredError"; }
+}
+
 async function getTokenForUser(userId) {
   const msalApp = createMsalApp();
   const row = await pool.query("SELECT token_cache FROM user_tokens WHERE user_id = $1", [userId]);
-  if (row.rows.length === 0) throw new Error("User not authenticated");
+  if (row.rows.length === 0) throw new ReauthRequiredError("User not authenticated");
   const cache = msalApp.getTokenCache();
   cache.deserialize(decrypt(row.rows[0].token_cache));
   const accounts = await cache.getAllAccounts();
-  if (!accounts || accounts.length === 0) throw new Error("No accounts in cache");
-  const result = await msalApp.acquireTokenSilent({ scopes: SCOPES, account: accounts[0] });
-  await pool.query("UPDATE user_tokens SET token_cache = $1, updated_at = NOW() WHERE user_id = $2", [encrypt(cache.serialize()), userId]);
-  return result.accessToken;
+  if (!accounts || accounts.length === 0) throw new ReauthRequiredError("No accounts in cache — re-authentication required");
+  try {
+    const result = await msalApp.acquireTokenSilent({ scopes: SCOPES, account: accounts[0] });
+    await pool.query("UPDATE user_tokens SET token_cache = $1, updated_at = NOW() WHERE user_id = $2", [encrypt(cache.serialize()), userId]);
+    return result.accessToken;
+  } catch (e) {
+    console.error(`acquireTokenSilent failed for ${userId}:`, e.message);
+    // Retry once with forceRefresh to handle edge cases where cached access token is stale
+    try {
+      const result = await msalApp.acquireTokenSilent({ scopes: SCOPES, account: accounts[0], forceRefresh: true });
+      await pool.query("UPDATE user_tokens SET token_cache = $1, updated_at = NOW() WHERE user_id = $2", [encrypt(cache.serialize()), userId]);
+      return result.accessToken;
+    } catch (retryErr) {
+      console.error(`acquireTokenSilent retry failed for ${userId}:`, retryErr.message);
+      // Clean up stale token cache so next auth starts fresh
+      await pool.query("DELETE FROM user_tokens WHERE user_id = $1", [userId]);
+      throw new ReauthRequiredError("Microsoft refresh token expired — re-authentication required");
+    }
+  }
 }
 
 async function getAppToken() {
@@ -930,9 +951,9 @@ app.all("/mcp", async (req, res) => {
     res.set("WWW-Authenticate", wwwAuth);
     return res.status(401).json({ error: "unauthorized" });
   }
-  // Fix 7: Check session expiry
+  // Fix 7: Check session expiry (sliding window based on last_used)
   const sessionRow = await pool.query(
-    `SELECT user_id FROM mcp_sessions WHERE access_token = $1 AND created_at > NOW() - INTERVAL '${SESSION_TTL_HOURS} hours'`,
+    `SELECT user_id FROM mcp_sessions WHERE access_token = $1 AND last_used > NOW() - INTERVAL '${SESSION_TTL_HOURS} hours'`,
     [bearerToken]
   );
   if (sessionRow.rows.length === 0) {
@@ -940,12 +961,24 @@ app.all("/mcp", async (req, res) => {
     return res.status(401).json({ error: "invalid_token" });
   }
   const userId = sessionRow.rows[0].user_id;
-  const userEmail = await getUserEmail(userId);
-  const server = createMcpServer(userId, userEmail);
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  res.on("close", () => transport.close());
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+  // Update last_used timestamp for sliding-window expiry
+  await pool.query("UPDATE mcp_sessions SET last_used = NOW() WHERE access_token = $1", [bearerToken]);
+  try {
+    const userEmail = await getUserEmail(userId);
+    const server = createMcpServer(userId, userEmail);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => transport.close());
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (e) {
+    if (e instanceof ReauthRequiredError) {
+      // Delete the stale session so Claude re-authenticates
+      await pool.query("DELETE FROM mcp_sessions WHERE access_token = $1", [bearerToken]);
+      res.set("WWW-Authenticate", wwwAuth);
+      return res.status(401).json({ error: "invalid_token", error_description: e.message });
+    }
+    throw e;
+  }
 });
 
 // --- Legacy per-user MCP Endpoint ---
@@ -1039,7 +1072,7 @@ app.use((err, req, res, next) => {
     process.exit(1);
   }
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`ESSA Custom MCP - Outlook_eMail v1.1.0 listening on 0.0.0.0:${PORT}`);
+    console.log(`ESSA Custom MCP - Outlook_eMail v1.2.0 listening on 0.0.0.0:${PORT}`);
     console.log(`Connector: ${BASE_URL}/mcp`);
     console.log(`DCR: ${BASE_URL}/oauth/register`);
     console.log(`ENV: DB=${!!process.env.DATABASE_URL} CLIENT=${!!CLIENT_ID} TENANT=${!!TENANT_ID} SECRET=${!!CLIENT_SECRET} ENCRYPTION=${!!TOKEN_ENCRYPTION_KEY}`);
